@@ -109,8 +109,28 @@ ALLOWED_UPLOAD_TYPES = ("video/",)                         # content-type must s
 # embedding = CLIP + Qdrant upsert; skipped = duplicate (user_id, source_hash).
 VIDEO_STATUSES = ("pending", "queued", "fetching", "sampling", "embedding",
                   "indexed", "skipped", "failed")
-# In-flight = occupying execution capacity (scheduled or running).
-INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "embedding")
+# In-flight = occupying execution capacity (scheduled or running). "parsing" and
+# "chunking" are document-only stages but living here costs videos nothing —
+# they simply never set those statuses.
+INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "parsing", "chunking", "embedding")
+
+# --- Document ingest (papers, decks) -------------------------------------------
+# Same shape as the video lifecycle: pending -> queued -> fetching -> parsing ->
+# chunking -> embedding -> indexed | skipped | failed. Runs on a second Prefect
+# deployment (src/ingest/document_pipeline.py) behind the same fair dispatcher.
+ENABLE_DOCUMENTS = _envbool("ENABLE_DOCUMENTS", True)
+DOC_KEY_PREFIX = "docs/"                        # docs/{user_id}/{doc_id}.pdf
+MAX_DOC_MB = _int("MAX_DOC_MB", 100)
+DOC_KINDS = ("paper",)                          # "deck" joins in Part 2
+DOCUMENT_STATUSES = ("pending", "queued", "fetching", "parsing", "chunking",
+                     "embedding", "indexed", "skipped", "failed")
+# Page-aware chunking: split each page's text at paragraph boundaries, accumulate
+# to ~PAPER_CHUNK_CHARS with PAPER_CHUNK_OVERLAP carried within the SAME page —
+# a chunk never spans two pages, so its `page` payload is always exact.
+PAPER_CHUNK_CHARS = _int("PAPER_CHUNK_CHARS", 1400)      # ~350 tokens, under bge's 512
+PAPER_CHUNK_OVERLAP = _int("PAPER_CHUNK_OVERLAP", 200)
+PAPER_MIN_CHUNK_CHARS = _int("PAPER_MIN_CHUNK_CHARS", 120)  # drop header/page-number fragments
+DOC_EMBED_BATCH = _int("DOC_EMBED_BATCH", 64)  # chunks per embed_docs()+upsert call
 
 # --- Fair scheduling (WFQ) ----------------------------------------------------
 # FIFO (default off): register enqueues to Prefect immediately -> Prefect runs

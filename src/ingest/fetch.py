@@ -38,6 +38,50 @@ def fetch_upload(storage_key: str, video_id: str) -> Path:
     return storage.download_to(storage_key, dest)
 
 
+# ── PDF documents (papers, decks) ────────────────────────────────────────────
+
+def fetch_pdf(uri: str, doc_id: str) -> Path:
+    """Acquire a document's source PDF into worker scratch.
+
+    Two sources, one contract — same pattern as fetch_upload/fetch_youtube:
+      * an http(s):// URL     — streamed down directly (no yt-dlp involved)
+      * a storage:// / bare key — already in our bucket (a browser upload via
+        presign), pulled the same way fetch_upload pulls a video
+    """
+    from ..config import MAX_DOC_MB
+
+    dest = scratch_dir() / f"{doc_id}.pdf"
+    if uri.startswith("storage://"):
+        return storage.download_to(uri.removeprefix("storage://"), dest)
+    if not (uri.startswith("http://") or uri.startswith("https://")):
+        raise ValueError(f"Unsupported document URI scheme: {uri!r}")
+    _download_http(uri, dest, MAX_DOC_MB * 1024 * 1024)
+    return dest
+
+
+def _download_http(url: str, dest: Path, max_bytes: int) -> None:
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "momentsearch/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        size = 0
+        with dest.open("wb") as out:
+            while chunk := resp.read(1 << 16):
+                size += len(chunk)
+                if size > max_bytes:
+                    out.close()
+                    dest.unlink(missing_ok=True)
+                    raise ValueError(f"Document exceeds the {max_bytes // (1024*1024)}MB limit.")
+                out.write(chunk)
+    # Cheap sanity check: an arXiv abstract page or a 404 HTML page can still
+    # return HTTP 200 — catch it here instead of failing obscurely in pypdf.
+    with dest.open("rb") as fh:
+        head = fh.read(5)
+    if head != b"%PDF-":
+        dest.unlink(missing_ok=True)
+        raise ValueError(f"URL did not return a PDF (got {head!r}): {url}")
+
+
 _cookie_path: str | None = None
 
 

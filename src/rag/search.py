@@ -28,14 +28,35 @@ def _seconds(ms: int) -> str:
     return f"{s // 60:02d}:{s % 60:02d}"
 
 
+def _locator_key(h: dict) -> tuple | None:
+    """Which discrete 'moment' a hit belongs to, for sources with no timeline.
+
+    Video hits fuse by TIME (a frame and a transcript line within
+    FUSION_WINDOW_S are the same instant — see the temporal path below).
+    Paper/deck hits have no t_start/ms; grouping them by time would collapse
+    EVERY page of a paper into one window (they'd all land at t=0). They fuse
+    by their real locator instead, so page 4 and page 7 stay two citations.
+    Returns None for anything that should use the temporal path (video hits,
+    and any future kind that does carry a timeline).
+    """
+    kind = h.get("kind")
+    if kind == "paper":
+        return (h["video_id"], "page", h.get("page"))
+    if kind == "deck":
+        return (h["video_id"], "slide", h.get("slide"))
+    return None
+
+
 def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
-    """Reciprocal-Rank-Fusion of the two branches into time windows.
+    """Reciprocal-Rank-Fusion of the two branches into 'moment' windows.
 
     Raw scores are incomparable (CLIP ~0.3 vs bge ~0.7), so we rank each branch
-    on its own and score by rank: rrf = 1/(RRF_K + rank). Then we bucket hits
-    within FUSION_WINDOW_S seconds of each other (same video) into one 'moment',
-    sum their rrf, and boost windows where BOTH modalities agree — two
-    independent signals pointing at the same instant is the strongest evidence.
+    on its own and score by rank: rrf = 1/(RRF_K + rank). Video hits bucket by
+    FUSION_WINDOW_S seconds of each other (same video) into one 'moment';
+    page/slide hits bucket by their exact locator (_locator_key) instead, since
+    they have no timeline to bucket by. Either way, hits landing in the same
+    window sum their rrf, boosted when BOTH modalities agree — two independent
+    signals pointing at the same instant is the strongest evidence.
     """
     def ranked(hits, modality):
         out = []
@@ -49,10 +70,16 @@ def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
     # a given modality is that modality's best hit there.
     for h in sorted(ranked(visual_hits, "frame") + ranked(text_hits, "text"),
                     key=lambda x: x["rrf"], reverse=True):
-        w = next((w for w in windows if w["video_id"] == h["video_id"]
-                  and abs(w["t"] - h["t"]) <= FUSION_WINDOW_S), None)
+        key = _locator_key(h)
+        if key is not None:
+            w = next((w for w in windows if w.get("key") == key), None)
+        else:
+            w = next((w for w in windows if w.get("key") is None
+                      and w["video_id"] == h["video_id"]
+                      and abs(w["t"] - h["t"]) <= FUSION_WINDOW_S), None)
         if w is None:
-            w = {"video_id": h["video_id"], "t": h["t"], "rrf": 0.0,
+            w = {"video_id": h["video_id"], "t": h["t"], "rrf": 0.0, "key": key,
+                 "kind": h.get("kind"), "page": h.get("page"), "slide": h.get("slide"),
                  "modalities": set(), "frame": None, "text": None}
             windows.append(w)
         w["modalities"].add(h["modality"])
@@ -66,6 +93,8 @@ def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
     for w in windows:
         # Score = best frame + best transcript hit; ×boost when BOTH modalities
         # agree at this instant (two independent signals = strongest evidence).
+        # Paper/deck windows never have a frame hit, so this boost never fires
+        # for them — correct, there's no second modality to agree with.
         w["rrf"] = (w["frame"]["rrf"] if w["frame"] else 0.0) + \
                    (w["text"]["rrf"] if w["text"] else 0.0)
         if {"frame", "text"} <= w["modalities"]:
@@ -116,20 +145,27 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
                                 video_id=video_id, video_ids=video_ids)
     best_visual = vhits[0]["score"] if vhits else 0.0
 
-    # Text branch — bge query→transcript-chunk (only if transcript is enabled).
+    # Text branch — bge query→chunk. This is the SHARED text collection: video
+    # transcript chunks AND paper/deck chunks both live here, so one search
+    # already returns both — "one shared index", not a per-source lookup.
     thits: list[dict] = []
     best_text = 0.0
-    if config.ENABLE_TRANSCRIPT:
+    if config.ENABLE_TRANSCRIPT or config.ENABLE_DOCUMENTS:
         thits = vector_store.search_text(embed_query(question), user_id,
                                          top_k=BRANCH_TOP_K, video_id=video_id,
                                          video_ids=video_ids)
         best_text = thits[0]["score"] if thits else 0.0
 
     windows = _fuse(vhits, thits)[:k]
-    videos = db.videos_by_ids(sorted({w["video_id"] for w in windows}))
+    ids = sorted({w["video_id"] for w in windows})
+    videos = db.videos_by_ids(ids)
+    docs = db.documents_by_ids(ids) if config.ENABLE_DOCUMENTS else {}
     citations = []
     for i, w in enumerate(windows, 1):
         vid = w["video_id"]
+        if w.get("kind") in ("paper", "deck"):
+            citations.append(_paper_citation(i, w, docs.get(vid) or {}))
+            continue
         meta = videos.get(vid)
         fr, tx = w["frame"], w["text"]
         # Anchor on the frame's exact timestamp when there is one (precise visual
@@ -139,6 +175,8 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
         citations.append({
             "n": i,
             "video_id": vid,
+            "kind": "video",
+            "locator": {"start_ms": ms},
             "title": (meta or {}).get("title") or vid,
             "url": (meta or {}).get("url"),
             "source": (meta or {}).get("source"),
@@ -153,6 +191,35 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
             "modalities": sorted(w["modalities"]),
         })
     return {"citations": citations, "best_visual": best_visual, "best_text": best_text}
+
+
+def _paper_citation(n: int, w: dict, meta: dict) -> dict[str, Any]:
+    """A paper 'moment' has no frame and no timestamp — its locator is the
+    page it was retrieved from, real because it rides straight through from
+    the chunk payload (chunk_pages() never lets a chunk span two pages)."""
+    tx = w["text"] or {}
+    page = w.get("page")
+    uri = meta.get("uri")
+    return {
+        "n": n,
+        "video_id": w["video_id"],
+        "kind": "paper",
+        "locator": {"page": page},
+        "page": page,
+        "title": meta.get("title") or tx.get("title") or w["video_id"],
+        "url": uri,
+        "source": meta.get("source"),
+        "timestamp": f"p. {page}" if page else "",
+        "idx": None,
+        "thumbnail": None,
+        "media_url": None,
+        # A page-anchored PDF fragment — the browser's built-in viewer honors it.
+        "deeplink": f"{uri}#page={page}" if uri and page else uri,
+        "score": round(w["rrf"], 4),
+        "text": tx.get("text"),
+        "transcript": tx.get("text"),  # same field the UI/LLM already read
+        "modalities": sorted(w["modalities"]),
+    }
 
 
 def _fallback_answer(citations: list[dict[str, Any]]) -> str:

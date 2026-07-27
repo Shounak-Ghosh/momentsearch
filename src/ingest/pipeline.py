@@ -24,13 +24,20 @@ from pathlib import Path
 
 from prefect import flow, task
 
-from .. import db, storage
-from ..config import CLIP_BATCH, EMBED_VERSION
-from ..rag import vector_store
-from ..rag.embeddings import embed_jpegs
-from . import fetch as fetch_mod
-from .dedup import dedup
-from .frames import Frame, sample
+# Absolute imports, deliberately — NOT `from .. import db, storage`. Prefect
+# Cloud reloads a scheduled run from this file's entrypoint path
+# ("src/ingest/pipeline.py:ingest_video"), executing it as a standalone
+# script with no parent package, where a `from ..` import fails with
+# "attempted relative import beyond top-level package". Absolute imports
+# rooted at `src` resolve correctly either way (normal package import from
+# worker.py, or Prefect's fresh entrypoint reload).
+from src import db, storage
+from src.config import CLIP_BATCH, EMBED_VERSION
+from src.rag import vector_store
+from src.rag.embeddings import embed_jpegs
+from src.ingest import fetch as fetch_mod
+from src.ingest.dedup import dedup
+from src.ingest.frames import Frame, sample
 
 _UPLOAD_POOL = 8  # concurrent thumbnail PUTs (I/O-bound)
 
@@ -126,9 +133,13 @@ def t_transcript(video_id: str, user_id: str) -> int:
     branch). Best-effort: uploads have no captions, some videos have none, and
     any failure just leaves the video visual-only — never fails the flow.
     Runs AFTER embed-index (whose delete clears both branches first)."""
-    from ..config import ENABLE_TRANSCRIPT, TEXT_EMBED_VERSION
-    from ..rag.embeddings import embed_docs
-    from .transcript import chunk_cues, fetch_transcript
+    # Absolute imports — see the top-of-file note: this function's relative
+    # imports would fail the same way if written as `from ..config import ...`
+    # (resolution depends on THIS module's own __package__, not on whether
+    # `src` is already loaded elsewhere).
+    from src.config import ENABLE_TRANSCRIPT, TEXT_EMBED_VERSION
+    from src.rag.embeddings import embed_docs
+    from src.ingest.transcript import chunk_cues, fetch_transcript
 
     if not ENABLE_TRANSCRIPT:
         return 0

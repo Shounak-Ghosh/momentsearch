@@ -25,6 +25,7 @@ from pathlib import Path
 from .config import (
     AWS_REGION,
     DATA,
+    DOC_KEY_PREFIX,
     FRAME_KEY_PREFIX,
     PRESIGN_EXPIRY_S,
     PRESIGN_GET_EXPIRY_S,
@@ -52,6 +53,21 @@ def frame_key(user_id: str, video_id: str, index: int) -> str:
 
 def frame_prefix(user_id: str, video_id: str) -> str:
     return f"{FRAME_KEY_PREFIX}{user_id}/{video_id}/"
+
+
+def doc_key(user_id: str, doc_id: str, ext: str = ".pdf") -> str:
+    """Where the raw source PDF is archived, once fetched."""
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}{ext}"
+
+
+def doc_parsed_key(user_id: str, doc_id: str) -> str:
+    """Cached parse output (page -> text), so a resumed run after a worker
+    crash skips re-parsing a stage that already finished."""
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/parsed.json"
+
+
+def doc_prefix(user_id: str, doc_id: str) -> str:
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/"
 
 
 def _s3():

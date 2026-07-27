@@ -56,6 +56,33 @@ CREATE INDEX IF NOT EXISTS ms_videos_user_idx   ON ms_videos (user_id, created_a
 CREATE INDEX IF NOT EXISTS ms_videos_status_idx ON ms_videos (status);
 CREATE INDEX IF NOT EXISTS ms_videos_hash_idx   ON ms_videos (user_id, source_hash);
 
+-- Documents (papers, decks) — the second source type. One row per document;
+-- `status` tracks the SAME shape of lifecycle as ms_videos, with two extra
+-- document-only stages (parsing, chunking) in front of embedding.
+CREATE TABLE IF NOT EXISTS ms_documents (
+    id           TEXT PRIMARY KEY,           -- doc_<hex10>
+    user_id      TEXT NOT NULL,
+    kind         TEXT NOT NULL,              -- paper | deck
+    source       TEXT NOT NULL,              -- url | upload
+    uri          TEXT,                       -- https://... (source=url)
+    storage_key  TEXT,                       -- docs/{user}/{doc_id}.pdf (source=upload,
+                                              -- and also where a url source is archived)
+    source_hash  TEXT,                       -- sha256 of the PDF bytes
+    title        TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    error        TEXT,
+    page_count   INT,
+    chunk_count  INT,
+    progress     REAL,                       -- 0..1 within the current stage
+    attempts     INT NOT NULL DEFAULT 0,
+    embed_version TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ms_documents_user_idx   ON ms_documents (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ms_documents_status_idx ON ms_documents (status);
+CREATE INDEX IF NOT EXISTS ms_documents_hash_idx   ON ms_documents (user_id, source_hash);
+
 -- Bring-your-own-model: a tenant's hosted LLM endpoint (vLLM / Ollama / any
 -- OpenAI-compatible server, NVIDIA NIM, or Anthropic). When a row exists the
 -- read path answers with THIS model instead of the server's LLM_* env config.
@@ -175,54 +202,184 @@ def delete_video(video_id: str) -> None:
         conn.execute("DELETE FROM ms_videos WHERE id = %s", (video_id,))
 
 
-# ── Fair scheduling (WFQ) ────────────────────────────────────────────────────
+# ── Documents (papers, decks) ────────────────────────────────────────────────
+# Mirrors the ms_videos functions above one-for-one; kept as separate functions
+# (rather than parameterizing the video ones by table) so the video path stays
+# byte-for-byte untouched — non-negotiable #6.
 
-def count_inflight() -> int:
-    """How many videos currently occupy execution capacity (scheduled/running)."""
+def upsert_pending_document(doc: dict[str, Any]) -> dict:
+    """Insert a document as pending; re-submitting an existing id resets it."""
     with pool().connection() as conn:
         row = conn.execute(
-            "SELECT count(*) AS n FROM ms_videos WHERE status = ANY(%s)",
-            (list(INFLIGHT_STATUSES),),
+            """
+            INSERT INTO ms_documents (id, user_id, kind, source, uri, storage_key,
+                                      source_hash, title, status)
+            VALUES (%(id)s, %(user_id)s, %(kind)s, %(source)s, %(uri)s,
+                    %(storage_key)s, %(source_hash)s, %(title)s, 'pending')
+            ON CONFLICT (id) DO UPDATE SET
+                uri = COALESCE(EXCLUDED.uri, ms_documents.uri),
+                storage_key = COALESCE(EXCLUDED.storage_key, ms_documents.storage_key),
+                source_hash = COALESCE(EXCLUDED.source_hash, ms_documents.source_hash),
+                title = COALESCE(EXCLUDED.title, ms_documents.title),
+                status = 'pending', error = NULL, progress = NULL, updated_at = now()
+            RETURNING *
+            """,
+            doc,
+        ).fetchone()
+    return row
+
+
+def set_doc_status(doc_id: str, status: str, *, error: str | None = None,
+                   title: str | None = None, page_count: int | None = None,
+                   chunk_count: int | None = None, source_hash: str | None = None,
+                   embed_version: str | None = None,
+                   progress: float | None = None) -> None:
+    with pool().connection() as conn:
+        conn.execute(
+            """
+            UPDATE ms_documents SET status = %s, error = %s,
+                title = COALESCE(%s, title),
+                page_count = COALESCE(%s, page_count),
+                chunk_count = COALESCE(%s, chunk_count),
+                source_hash = COALESCE(%s, source_hash),
+                embed_version = COALESCE(%s, embed_version),
+                progress = %s,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (status, error, title, page_count, chunk_count, source_hash,
+             embed_version, progress, doc_id),
+        )
+
+
+def set_doc_progress(doc_id: str, progress: float) -> None:
+    with pool().connection() as conn:
+        conn.execute("UPDATE ms_documents SET progress = %s, updated_at = now() WHERE id = %s",
+                     (round(progress, 3), doc_id))
+
+
+def bump_doc_attempts(doc_id: str) -> int:
+    with pool().connection() as conn:
+        row = conn.execute(
+            "UPDATE ms_documents SET attempts = attempts + 1, updated_at = now() WHERE id = %s RETURNING attempts",
+            (doc_id,),
+        ).fetchone()
+    return row["attempts"] if row else 0
+
+
+def get_document(doc_id: str) -> dict | None:
+    with pool().connection() as conn:
+        return conn.execute("SELECT * FROM ms_documents WHERE id = %s", (doc_id,)).fetchone()
+
+
+def find_duplicate_document(user_id: str, source_hash: str, exclude_id: str) -> dict | None:
+    """An already-indexed document with the same content for the same user."""
+    with pool().connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM ms_documents
+            WHERE user_id = %s AND source_hash = %s AND id <> %s AND status = 'indexed'
+            LIMIT 1
+            """,
+            (user_id, source_hash, exclude_id),
+        ).fetchone()
+
+
+def list_documents(user_id: str, status: str | None = None) -> list[dict]:
+    q = "SELECT * FROM ms_documents WHERE user_id = %s"
+    params: list = [user_id]
+    if status:
+        q += " AND status = %s"
+        params.append(status)
+    q += " ORDER BY created_at DESC"
+    with pool().connection() as conn:
+        return conn.execute(q, tuple(params)).fetchall()
+
+
+def documents_by_ids(ids: list[str]) -> dict[str, dict]:
+    """Metadata join for search citations (title/uri live here, not in Qdrant)."""
+    if not ids:
+        return {}
+    with pool().connection() as conn:
+        rows = conn.execute("SELECT * FROM ms_documents WHERE id = ANY(%s)", (ids,)).fetchall()
+    return {r["id"]: r for r in rows}
+
+
+def delete_document(doc_id: str) -> None:
+    with pool().connection() as conn:
+        conn.execute("DELETE FROM ms_documents WHERE id = %s", (doc_id,))
+
+
+# ── Fair scheduling (WFQ) ────────────────────────────────────────────────────
+# Fair across BOTH source types: a user backfilling 40 papers can't starve a
+# user adding one video, and vice versa — the round-robin partitions by
+# user_id across the union of both tables' pending rows.
+
+def count_inflight() -> int:
+    """How many videos+documents currently occupy execution capacity."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            """
+            SELECT (SELECT count(*) FROM ms_videos WHERE status = ANY(%s)) +
+                   (SELECT count(*) FROM ms_documents WHERE status = ANY(%s)) AS n
+            """,
+            (list(INFLIGHT_STATUSES), list(INFLIGHT_STATUSES)),
         ).fetchone()
     return row["n"] if row else 0
 
 
-def wfq_claim(limit: int) -> list[dict]:
-    """Atomically claim up to `limit` pending videos in FAIR (round-robin across
-    users) order, flipping them pending -> queued. Returns the claimed rows.
+def wfq_claim_all(limit: int) -> list[dict]:
+    """Atomically claim up to `limit` pending videos+documents in FAIR
+    (round-robin across users, irrespective of source type) order, flipping
+    them pending -> queued. Returns [{id, user_id, entity, kind}].
 
-    Fairness: rank each user's pending videos by age (row_number partitioned by
-    user_id), then order by that rank first — so we take everyone's oldest, then
-    everyone's 2nd, ... A user who dumped 50 videos only gets one slot per round,
-    exactly like the others. The UPDATE ... WHERE status='pending' RETURNING is
-    the atomic claim: if two dispatchers race, each row is handed out once.
+    Fairness: rank each user's pending rows (videos AND documents together) by
+    age, then order by that rank first — so we take everyone's oldest item
+    first, then everyone's 2nd, ... The two per-table UPDATE ... WHERE
+    status='pending' RETURNING statements are the atomic claim: if two
+    dispatchers race, each row is handed out once.
     """
     if limit <= 0:
         return []
     with pool().connection() as conn:
         picked = conn.execute(
             """
-            SELECT id FROM (
-                SELECT id, row_number() OVER (
-                    PARTITION BY user_id ORDER BY created_at, id) AS rn
-                FROM ms_videos WHERE status = 'pending'
-            ) t
-            ORDER BY rn, id
+            SELECT id, user_id, entity FROM (
+                SELECT id, user_id, 'video' AS entity, created_at FROM ms_videos
+                WHERE status = 'pending'
+                UNION ALL
+                SELECT id, user_id, 'document' AS entity, created_at FROM ms_documents
+                WHERE status = 'pending'
+            ) u
+            ORDER BY row_number() OVER (PARTITION BY user_id ORDER BY created_at, id), id
             LIMIT %s
             """,
             (limit,),
         ).fetchall()
-        ids = [r["id"] for r in picked]
-        if not ids:
-            return []
-        return conn.execute(
-            """
-            UPDATE ms_videos SET status = 'queued', updated_at = now()
-            WHERE id = ANY(%s) AND status = 'pending'
-            RETURNING id, user_id
-            """,
-            (ids,),
-        ).fetchall()
+        video_ids = [r["id"] for r in picked if r["entity"] == "video"]
+        doc_ids = [r["id"] for r in picked if r["entity"] == "document"]
+        claimed: list[dict] = []
+        if video_ids:
+            rows = conn.execute(
+                """
+                UPDATE ms_videos SET status = 'queued', updated_at = now()
+                WHERE id = ANY(%s) AND status = 'pending'
+                RETURNING id, user_id
+                """,
+                (video_ids,),
+            ).fetchall()
+            claimed.extend({**r, "entity": "video", "kind": "video"} for r in rows)
+        if doc_ids:
+            rows = conn.execute(
+                """
+                UPDATE ms_documents SET status = 'queued', updated_at = now()
+                WHERE id = ANY(%s) AND status = 'pending'
+                RETURNING id, user_id, kind
+                """,
+                (doc_ids,),
+            ).fetchall()
+            claimed.extend({**r, "entity": "document"} for r in rows)
+        return claimed
 
 
 # ── Bring-your-own-model (per-tenant LLM endpoint) ───────────────────────────

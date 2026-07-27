@@ -1,15 +1,17 @@
 """MomentSearch — unified API (one service, one port).
 
-Two routers on one FastAPI app (:8000):
-  - src/api/videos.py  /api/videos/*  — presigned uploads + registration +
-                                        ingest status (Bearer auth)
-  - src/api/search.py  public         — / (web UI), /api/ask, /api/config,
-                                        local-dev media, /api/health
+Three routers on one FastAPI app (:8000):
+  - src/api/videos.py     /api/videos/*     — presigned uploads + registration +
+                                              ingest status (Bearer auth)
+  - src/api/documents.py  /api/documents/*  — paper/deck registration + ingest
+                                              status (Bearer auth)
+  - src/api/search.py     public            — / (web UI), /api/ask, /api/config,
+                                              local-dev media, /api/health
 
-Heavy processing never happens here — the videos router only schedules Prefect
-flow runs; worker.py (separate process, same image) executes the ingest
-pipeline. Every durable byte lives in object storage, Qdrant, or Postgres, so
-this process is stateless and disposable.
+Heavy processing never happens here — the videos/documents routers only
+schedule Prefect flow runs; worker.py (separate process, same image) executes
+the ingest pipelines. Every durable byte lives in object storage, Qdrant, or
+Postgres, so this process is stateless and disposable.
 
 Run:
     uvicorn src.app:app --port 8000
@@ -21,6 +23,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import config, db
+from .api.documents import router as documents_router
 from .api.search import router as search_router
 from .api.videos import router as videos_router
 from .rag import vector_store
@@ -34,8 +37,9 @@ async def lifespan(app: FastAPI):
     # "no moments" instead of a 500. Qdrant being down must not block boot.
     try:
         vector_store.ensure_collection()          # visual (CLIP frames)
-        if config.ENABLE_TRANSCRIPT:
-            vector_store.ensure_text_collection()  # transcript (bge text)
+        if config.ENABLE_TRANSCRIPT or config.ENABLE_DOCUMENTS:
+            vector_store.ensure_text_collection()  # SHARED text collection:
+            # video transcripts AND paper/deck chunks both index here.
     except Exception as exc:
         print(f"[startup] Qdrant not ready ({exc!r}) — search degrades to empty results")
     yield
@@ -43,4 +47,5 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="MomentSearch", version="1.0.0", lifespan=lifespan)
 app.include_router(videos_router)
+app.include_router(documents_router)
 app.include_router(search_router)

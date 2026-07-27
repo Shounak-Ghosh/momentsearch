@@ -22,6 +22,10 @@ numpy>=1.24
 # Transcript (text) branch — bge semantic embeddings, ONNX (no torch), tiny
 fastembed>=0.3
 
+# Paper ingestion (PDF -> page-aware chunks). BSD-3, pure python, license-
+# compatible with this Apache-2.0 repo (unlike PyMuPDF, which is AGPL-3.0).
+pypdf>=5.0
+
 # Video acquisition (YouTube path). Keep this CURRENT — YouTube changes its
 # bot-detection constantly and old yt-dlp versions stop working first.
 yt-dlp>=2026.7.4

@@ -124,6 +124,17 @@ def _ensure(collection: str, dim: int) -> None:
                                field_schema=qm.PayloadSchemaType.KEYWORD)
     except Exception:
         pass
+    # "kind" (video | paper | deck): not filtered on by any production query
+    # today (retrieval/delete only ever filter by user_id/video_id), but
+    # Qdrant's strict mode (Qdrant Cloud default) rejects an unindexed filter
+    # outright rather than falling back to a scan — so a kind-scoped filter
+    # (debugging, or a future "papers only" search) needs this index to exist
+    # ahead of time. Cheap: this call is idempotent and re-runs on every boot.
+    try:
+        c.create_payload_index(collection_name=collection, field_name="kind",
+                               field_schema=qm.PayloadSchemaType.KEYWORD)
+    except Exception:
+        pass
 
 
 def ensure_collection() -> None:
@@ -180,6 +191,25 @@ def upsert_chunks(user_id: str, video_id: str, vectors: np.ndarray,
     '<video_id>:text:<i>' so re-runs overwrite, and never collide with frame ids."""
     points = [
         qm.PointStruct(id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{video_id}:text:{i}")),
+                       vector=vec.tolist(), payload=payload)
+        for i, (vec, payload) in enumerate(zip(vectors, payloads))
+    ]
+    if points:
+        client().upsert(collection_name=TEXT_COLLECTION, points=points, wait=True)
+
+
+def upsert_doc_chunks(user_id: str, doc_id: str, vectors: np.ndarray,
+                      payloads: list[dict[str, Any]], start_idx: int = 0) -> None:
+    """Paper/deck chunks into the SAME text collection as video transcripts —
+    "one shared index", not a per-type collection. `start_idx` lets a large
+    document be embedded in batches without re-enumerating from 0 each call
+    (unlike upsert_chunks, which always restarts at 0 — fine for one video's
+    transcript in a single call, wrong for a paper embedded over many
+    batches). IDs are uuid5 of '<doc_id>:doc:<i>' — deterministic, so re-runs
+    overwrite instead of duplicating, and never collide with frame ids or the
+    ':text:' transcript ids."""
+    points = [
+        qm.PointStruct(id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{doc_id}:doc:{start_idx + i}")),
                        vector=vec.tolist(), payload=payload)
         for i, (vec, payload) in enumerate(zip(vectors, payloads))
     ]
