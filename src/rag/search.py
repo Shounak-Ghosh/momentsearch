@@ -164,7 +164,7 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
     for i, w in enumerate(windows, 1):
         vid = w["video_id"]
         if w.get("kind") in ("paper", "deck"):
-            citations.append(_paper_citation(i, w, docs.get(vid) or {}))
+            citations.append(_doc_citation(i, w, docs.get(vid) or {}, user_id))
             continue
         meta = videos.get(vid)
         fr, tx = w["frame"], w["text"]
@@ -193,13 +193,46 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
     return {"citations": citations, "best_visual": best_visual, "best_text": best_text}
 
 
-def _paper_citation(n: int, w: dict, meta: dict) -> dict[str, Any]:
-    """A paper 'moment' has no frame and no timestamp — its locator is the
-    page it was retrieved from, real because it rides straight through from
-    the chunk payload (chunk_pages() never lets a chunk span two pages)."""
+def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
+    """A paper/deck 'moment' has no frame and no timestamp — its locator is
+    the page or slide it was retrieved from, real because it rides straight
+    through from the chunk payload (chunk_pages()/chunk_slides() never let a
+    chunk span two pages/slides)."""
+    kind = w.get("kind")
     tx = w["text"] or {}
-    page = w.get("page")
     uri = meta.get("uri")
+    if kind == "deck":
+        slide = w.get("slide")
+        thumbnail = None
+        if slide:
+            key = storage.slide_key(user_id, w["video_id"], slide)
+            if storage.presign_capable():
+                thumbnail = storage.presign_get(key)
+            elif storage.exists(key):
+                thumbnail = f"/api/slide/{w['video_id']}/{slide:04d}.jpg?u={user_id}"
+        # PDF decks support the same #page= fragment as papers; a PPTX has no
+        # page-anchored viewing convention, so its deeplink is just the file.
+        is_pdf = (uri or "").split("?", 1)[0].lower().endswith(".pdf")
+        return {
+            "n": n,
+            "video_id": w["video_id"],
+            "kind": "deck",
+            "locator": {"slide": slide},
+            "slide": slide,
+            "title": meta.get("title") or tx.get("title") or w["video_id"],
+            "url": uri,
+            "source": meta.get("source"),
+            "timestamp": f"Slide {slide}" if slide else "",
+            "idx": None,
+            "thumbnail": thumbnail,
+            "media_url": None,
+            "deeplink": (f"{uri}#page={slide}" if uri and slide and is_pdf else uri),
+            "score": round(w["rrf"], 4),
+            "text": tx.get("text"),
+            "transcript": tx.get("text"),  # same field the UI/LLM already read
+            "modalities": sorted(w["modalities"]),
+        }
+    page = w.get("page")
     return {
         "n": n,
         "video_id": w["video_id"],

@@ -109,21 +109,24 @@ ALLOWED_UPLOAD_TYPES = ("video/",)                         # content-type must s
 # embedding = CLIP + Qdrant upsert; skipped = duplicate (user_id, source_hash).
 VIDEO_STATUSES = ("pending", "queued", "fetching", "sampling", "embedding",
                   "indexed", "skipped", "failed")
-# In-flight = occupying execution capacity (scheduled or running). "parsing" and
-# "chunking" are document-only stages but living here costs videos nothing —
-# they simply never set those statuses.
-INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "parsing", "chunking", "embedding")
+# In-flight = occupying execution capacity (scheduled or running). "parsing",
+# "captioning" and "chunking" are document-only stages but living here costs
+# videos nothing — they simply never set those statuses.
+INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "parsing", "captioning",
+                     "chunking", "embedding")
 
 # --- Document ingest (papers, decks) -------------------------------------------
 # Same shape as the video lifecycle: pending -> queued -> fetching -> parsing ->
-# chunking -> embedding -> indexed | skipped | failed. Runs on a second Prefect
-# deployment (src/ingest/document_pipeline.py) behind the same fair dispatcher.
+# (captioning) -> chunking -> embedding -> indexed | skipped | failed. Runs on a
+# second Prefect deployment (src/ingest/document_pipeline.py) behind the same
+# fair dispatcher.
 ENABLE_DOCUMENTS = _envbool("ENABLE_DOCUMENTS", True)
-DOC_KEY_PREFIX = "docs/"                        # docs/{user_id}/{doc_id}.pdf
+DOC_KEY_PREFIX = "docs/"                        # docs/{user_id}/{doc_id}.<ext>
 MAX_DOC_MB = _int("MAX_DOC_MB", 100)
-DOC_KINDS = ("paper",)                          # "deck" joins in Part 2
-DOCUMENT_STATUSES = ("pending", "queued", "fetching", "parsing", "chunking",
-                     "embedding", "indexed", "skipped", "failed")
+DOC_KINDS = ("paper", "deck")
+ALLOWED_DOC_EXTS = (".pdf", ".pptx")
+DOCUMENT_STATUSES = ("pending", "queued", "fetching", "parsing", "captioning",
+                     "chunking", "embedding", "indexed", "skipped", "failed")
 # Page-aware chunking: split each page's text at paragraph boundaries, accumulate
 # to ~PAPER_CHUNK_CHARS with PAPER_CHUNK_OVERLAP carried within the SAME page —
 # a chunk never spans two pages, so its `page` payload is always exact.
@@ -131,6 +134,20 @@ PAPER_CHUNK_CHARS = _int("PAPER_CHUNK_CHARS", 1400)      # ~350 tokens, under bg
 PAPER_CHUNK_OVERLAP = _int("PAPER_CHUNK_OVERLAP", 200)
 PAPER_MIN_CHUNK_CHARS = _int("PAPER_MIN_CHUNK_CHARS", 120)  # drop header/page-number fragments
 DOC_EMBED_BATCH = _int("DOC_EMBED_BATCH", 64)  # chunks per embed_docs()+upsert call
+
+# --- Deck ingest (slides: PDF or PPTX) -------------------------------------------
+# Same never-spans-a-boundary rule as papers, but per SLIDE: the locator IS the
+# slide number, so a chunk never mixes text from two slides.
+DECK_CHUNK_CHARS = _int("DECK_CHUNK_CHARS", 1800)     # slide text + notes + caption
+DECK_MIN_CHUNK_CHARS = _int("DECK_MIN_CHUNK_CHARS", 60)  # lower than papers — slides are terse
+# Image-heavy slides (charts, diagrams drawn as vector shapes) extract little or
+# no text — captioning them with the vision LLM is what makes them retrievable
+# at all (A3's "deck slides retrieve poorly" troubleshooting entry).
+DECK_CAPTION_ENABLED = _envbool("DECK_CAPTION_ENABLED", True)
+DECK_CAPTION_MIN_CHARS = _int("DECK_CAPTION_MIN_CHARS", 200)  # below this -> caption the slide
+DECK_CAPTION_MAX_SLIDES = _int("DECK_CAPTION_MAX_SLIDES", 80)  # hard cost cap per deck
+DECK_RENDER_WIDTH = _int("DECK_RENDER_WIDTH", 1024)   # rasterized px fed to the vision LLM
+DECK_THUMB_WIDTH = _int("DECK_THUMB_WIDTH", 480)      # stored citation thumbnail
 
 # --- Fair scheduling (WFQ) ----------------------------------------------------
 # FIFO (default off): register enqueues to Prefect immediately -> Prefect runs

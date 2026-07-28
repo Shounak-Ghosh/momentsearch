@@ -56,14 +56,33 @@ def frame_prefix(user_id: str, video_id: str) -> str:
 
 
 def doc_key(user_id: str, doc_id: str, ext: str = ".pdf") -> str:
-    """Where the raw source PDF is archived, once fetched."""
+    """Where the raw source file (paper PDF, or PDF/PPTX deck) is archived,
+    once fetched. Callers pass the real ext (fetch.doc_ext) so a deck's
+    archive and delete never disagree about its format."""
     return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}{ext}"
 
 
 def doc_parsed_key(user_id: str, doc_id: str) -> str:
-    """Cached parse output (page -> text), so a resumed run after a worker
-    crash skips re-parsing a stage that already finished."""
+    """Cached parse output (page/slide -> text), so a resumed run after a
+    worker crash skips re-parsing a stage that already finished."""
     return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/parsed.json"
+
+
+def doc_captions_key(user_id: str, doc_id: str) -> str:
+    """Cached vision captions (slide -> caption text), decks only. Same
+    resume rationale as doc_parsed_key — but higher stakes: this stage costs
+    real LLM calls, and the resilience gate asserts finished stages aren't
+    re-run."""
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/captions.json"
+
+
+def slide_key(user_id: str, doc_id: str, slide: int) -> str:
+    """Rendered slide thumbnail (deck citations point the UI here)."""
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/slides/{slide:04d}.jpg"
+
+
+def slide_prefix(user_id: str, doc_id: str) -> str:
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/slides/"
 
 
 def doc_prefix(user_id: str, doc_id: str) -> str:

@@ -65,6 +65,18 @@ SYSTEM = (
 )
 
 
+CAPTION_SYSTEM = (
+    "You describe a single slide from a presentation deck for a search index. "
+    "Transcribe ALL visible text verbatim, in reading order — titles, labels, "
+    "axis names, legend entries, numbers. Then describe what the image/chart/"
+    "diagram shows factually: what kind of visual it is, what it depicts, and "
+    "any values or relationships it makes visible. Be concrete and literal. "
+    "Do not speculate about what the speaker might be saying, do not add "
+    "commentary, and do not describe anything not actually visible in the "
+    "image. Keep it to a few sentences."
+)
+
+
 @dataclass
 class LLMConfig:
     provider: str = "openai"
@@ -190,5 +202,72 @@ def _answer_anthropic(cfg: LLMConfig, question: str, moments: list[dict]) -> str
         max_tokens=cfg.max_tokens,
         system=SYSTEM,
         messages=[{"role": "user", "content": blocks}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+# ── Slide captioning (deck ingestion — Part 2) ────────────────────────────────
+# A slide with little/no extractable text (a chart, diagram, or screenshot
+# drawn as vector shapes) is otherwise invisible to the text index. One vision
+# call per such slide turns it into a searchable, grounded caption. Separate
+# from answer() because it's a one-image describe task, not a numbered-moment
+# Q&A — the "moments" framing/citation validation doesn't apply here.
+
+def _caption_prompt(hint: str) -> str:
+    base = "Describe this slide for a search index."
+    if hint.strip():
+        # Whatever text WAS extracted (a title, a label) — steer the model to
+        # describe the REST (the figure/chart), not re-transcribe what we
+        # already have.
+        base += (f" Text already extracted from this slide: \"{hint.strip()}\". "
+                 "Focus your description on the image/chart/diagram content, "
+                 "not on repeating that text.")
+    return base
+
+
+def caption_image(cfg: LLMConfig, jpeg: bytes, hint: str = "") -> str:
+    """One factual, grounded caption for a rendered slide image. `hint` is
+    whatever text extraction already found (may be empty for an image-only
+    slide) — passed so the model describes the figure, not the title again."""
+    max_tokens = min(cfg.max_tokens, 300)  # this runs per slide; keep it cheap
+    if cfg.provider == "anthropic":
+        return _caption_anthropic(cfg, jpeg, hint, max_tokens)
+    return _caption_openai(cfg, jpeg, hint, max_tokens)
+
+
+def _caption_openai(cfg: LLMConfig, jpeg: bytes, hint: str, max_tokens: int) -> str:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=cfg.api_key or "not-needed", base_url=_base_url(cfg))
+    uri = f"data:image/jpeg;base64,{base64.b64encode(_downscale(jpeg)).decode()}"
+    resp = client.chat.completions.create(
+        model=cfg.model,
+        messages=[
+            {"role": "system", "content": CAPTION_SYSTEM},
+            {"role": "user", "content": [
+                {"type": "text", "text": _caption_prompt(hint)},
+                {"type": "image_url", "image_url": {"url": uri}},
+            ]},
+        ],
+        temperature=0.2,
+        max_tokens=max_tokens,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _caption_anthropic(cfg: LLMConfig, jpeg: bytes, hint: str, max_tokens: int) -> str:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=cfg.api_key, base_url=cfg.base_url or None)
+    resp = client.messages.create(
+        model=cfg.model,
+        max_tokens=max_tokens,
+        system=CAPTION_SYSTEM,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": _caption_prompt(hint)},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg",
+                "data": base64.b64encode(_downscale(jpeg)).decode()}},
+        ]}],
     )
     return "".join(b.text for b in resp.content if b.type == "text").strip()

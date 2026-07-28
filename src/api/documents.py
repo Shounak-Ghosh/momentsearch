@@ -18,16 +18,75 @@ Every request is tenant-scoped by the X-User-Id header, same as videos.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import config, db, jobs, storage
-from ..config import DOC_KEY_PREFIX, DOC_KINDS, MAX_DOC_MB
+from ..config import ALLOWED_DOC_EXTS, DOC_KEY_PREFIX, DOC_KINDS, MAX_DOC_MB
+from ..ingest.fetch import doc_ext
 from ..rag import vector_store
 from .videos import require_auth, user_id
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
+
+
+def _ext_of(value: str) -> str:
+    """Suffix of a URL or storage key, ignoring a query string."""
+    return Path(value.split("?", 1)[0]).suffix.lower()
+
+
+# ── Presign (browser -> bucket upload, for a local .pdf/.pptx) ────────────────
+# Same shape as src/api/videos.py's /presign: mint the doc_id + key up front,
+# the browser PUTs the bytes straight to object storage, then POST /api/documents
+# with uri="storage://<key>" (the register() branch above already handles
+# storage:// uris — this just gives a local deck/paper a key to point at).
+
+class PresignDocRequest(BaseModel):
+    filename: str
+    content_type: str
+    size: int
+
+
+@router.post("/presign", dependencies=[Depends(require_auth)])
+def presign(req: PresignDocRequest, uid: str = Depends(user_id)):
+    if req.size > MAX_DOC_MB * 1024 * 1024:
+        raise HTTPException(413, f"File exceeds the {MAX_DOC_MB}MB limit.")
+    ext = Path(req.filename or "").suffix.lower()
+    if ext not in ALLOWED_DOC_EXTS:
+        raise HTTPException(415, f"Only {ALLOWED_DOC_EXTS} are accepted.")
+    doc_id = f"doc_{uuid.uuid4().hex[:10]}"
+    key = storage.doc_key(uid, doc_id, ext)
+    if not storage.presign_capable():
+        # local-dev fallback: the API accepts the bytes itself
+        return {"mode": "direct", "doc_id": doc_id, "key": key,
+                "url": f"/api/documents/{doc_id}/content?key={key}",
+                "headers": {"Content-Type": req.content_type}}
+    signed = storage.presign_put(key, req.content_type)
+    return {"mode": "presigned", "doc_id": doc_id, "key": key, **signed}
+
+
+@router.put("/{doc_id}/content", dependencies=[Depends(require_auth)])
+async def upload_direct(doc_id: str, key: str, request: Request,
+                        uid: str = Depends(user_id)):
+    """Dev-only direct upload (STORAGE_PROVIDER=local can't presign)."""
+    if storage.presign_capable():
+        raise HTTPException(400, "Use the presigned URL to upload.")
+    if not key.startswith(f"{DOC_KEY_PREFIX}{uid}/{doc_id}"):
+        raise HTTPException(403, "Key does not belong to this upload.")
+    dest = storage.local_path(key)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    with dest.open("wb") as out:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > MAX_DOC_MB * 1024 * 1024:
+                out.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(413, f"File exceeds the {MAX_DOC_MB}MB limit.")
+            out.write(chunk)
+    return {"ok": True, "key": key, "size": size}
 
 
 # ── Register (returns 202 instantly; a worker does the heavy lifting) ─────────
@@ -48,6 +107,14 @@ def register(req: RegisterDocument, uid: str = Depends(user_id)):
     doc_id = f"doc_{uuid.uuid4().hex[:10]}"
 
     if uri.startswith("http://") or uri.startswith("https://"):
+        # A recognizable extension is required for an upload (the presigned
+        # key's own suffix), but many paper URLs (arXiv-style) carry none —
+        # only reject a URL whose extension IS present and unsupported (e.g.
+        # a .docx), not one with no extension at all (fetch.doc_ext falls
+        # back to .pdf for those, matching the paper flow's prior behavior).
+        ext = _ext_of(uri)
+        if ext and ext not in ALLOWED_DOC_EXTS:
+            raise HTTPException(400, f"Unsupported file type {ext!r}; must be one of {ALLOWED_DOC_EXTS}.")
         row = db.upsert_pending_document({
             "id": doc_id, "user_id": uid, "kind": kind, "source": "url",
             "uri": uri, "storage_key": None, "source_hash": None,
@@ -59,6 +126,8 @@ def register(req: RegisterDocument, uid: str = Depends(user_id)):
         # user's own document prefix (same ownership rule as video uploads).
         if not key.startswith(f"{DOC_KEY_PREFIX}{uid}/"):
             raise HTTPException(403, "Key does not belong to this user.")
+        if _ext_of(key) not in ALLOWED_DOC_EXTS:
+            raise HTTPException(400, f"Unsupported file type; must be one of {ALLOWED_DOC_EXTS}.")
         meta = storage.head(key)
         if meta is None:
             raise HTTPException(404, "Object not found — did the upload finish?")
@@ -124,8 +193,10 @@ def delete(doc_id: str, uid: str = Depends(user_id)):
     if row is None or row["user_id"] != uid:
         raise HTTPException(404, "Document not found.")
     vector_store.delete_video(uid, doc_id)  # shared purge fn, keyed by video_id/doc_id
-    storage.delete_prefix(storage.doc_prefix(uid, doc_id))  # parsed.json cache
-    storage.delete_key(storage.doc_key(uid, doc_id))         # archived raw PDF
+    # parsed.json, captions.json, and rendered slide thumbnails all live under
+    # this same prefix (storage.slide_key/doc_parsed_key/doc_captions_key).
+    storage.delete_prefix(storage.doc_prefix(uid, doc_id))
+    storage.delete_key(storage.doc_key(uid, doc_id, doc_ext(row)))  # archived raw file
     if row.get("storage_key"):
         storage.delete_key(row["storage_key"])
     db.delete_document(doc_id)

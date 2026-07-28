@@ -26,6 +26,14 @@ fastembed>=0.3
 # compatible with this Apache-2.0 repo (unlike PyMuPDF, which is AGPL-3.0).
 pypdf>=5.0
 
+# Deck ingestion (PPTX slide text/notes/embedded images). MIT, pure python,
+# no LibreOffice or system deps.
+python-pptx>=1.0
+# Deck ingestion (PDF slide -> JPEG rasterization, for vision captioning).
+# Apache-2.0/BSD-3, prebuilt wheels, no system deps — same AGPL reason PyMuPDF
+# is avoided here as it was for pypdf above.
+pypdfium2>=4.30
+
 # Video acquisition (YouTube path). Keep this CURRENT — YouTube changes its
 # bot-detection constantly and old yt-dlp versions stop working first.
 yt-dlp>=2026.7.4
