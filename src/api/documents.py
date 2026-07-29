@@ -17,6 +17,7 @@ Every request is tenant-scoped by the X-User-Id header, same as videos.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from pathlib import Path
 
@@ -31,10 +32,20 @@ from .videos import require_auth, user_id
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
+# A real file extension is alphabetic — ".pdf", ".pptx". Path.suffix is purely
+# textual, so it reads the trailing segment of an extensionless paper URL as an
+# "extension" too: https://arxiv.org/pdf/2312.10997 -> ".10997", and
+# .../2312.10997v2 -> ".10997v2". Those are arXiv ids, not formats, and
+# rejecting them would 400 the single most common way to register a paper.
+_EXT_RE = re.compile(r"^\.[A-Za-z]{1,8}$")
+
 
 def _ext_of(value: str) -> str:
-    """Suffix of a URL or storage key, ignoring a query string."""
-    return Path(value.split("?", 1)[0]).suffix.lower()
+    """The file extension of a URL or storage key, ignoring a query string.
+    Returns "" when there isn't one — including for a version-numbered paper
+    URL, which fetch.doc_ext then handles by defaulting to .pdf."""
+    suffix = Path(value.split("?", 1)[0]).suffix.lower()
+    return suffix if _EXT_RE.match(suffix) else ""
 
 
 # ── Presign (browser -> bucket upload, for a local .pdf/.pptx) ────────────────
@@ -97,6 +108,17 @@ class RegisterDocument(BaseModel):
     title: str | None = None
 
 
+def _enqueue(doc_id: str, uid: str) -> str:
+    """Schedule the queue run, turning an unreachable Prefect into a 502 (an
+    upstream failure) rather than a bare 500. Only reached with fair dispatch
+    OFF — with it on (the default) nothing talks to Prefect in the request
+    path at all, which is what keeps accept latency inside the SLA."""
+    try:
+        return jobs.enqueue_document(doc_id, uid)
+    except Exception as exc:
+        raise HTTPException(502, f"Could not reach the work queue: {exc}") from exc
+
+
 @router.post("", status_code=202, dependencies=[Depends(require_auth)])
 def register(req: RegisterDocument, uid: str = Depends(user_id)):
     kind = (req.kind or "").strip().lower()
@@ -145,7 +167,7 @@ def register(req: RegisterDocument, uid: str = Depends(user_id)):
     # fair order alongside videos (src/dispatcher.py). FIFO mode: enqueue now.
     if config.ENABLE_FAIR_DISPATCH:
         return {"id": row["id"], "status": "pending", "kind": kind}
-    flow_run_id = jobs.enqueue_document(row["id"], uid)
+    flow_run_id = _enqueue(row["id"], uid)
     return {"id": row["id"], "status": row["status"], "kind": kind, "flow_run_id": flow_run_id}
 
 
@@ -181,7 +203,7 @@ def retry(doc_id: str, uid: str = Depends(user_id)):
     db.set_doc_status(doc_id, "pending", error=None)
     if config.ENABLE_FAIR_DISPATCH:
         return {"id": doc_id, "status": "pending"}  # dispatcher re-admits it fairly
-    flow_run_id = jobs.enqueue_document(doc_id, uid)
+    flow_run_id = _enqueue(doc_id, uid)
     return {"id": doc_id, "status": "pending", "flow_run_id": flow_run_id}
 
 

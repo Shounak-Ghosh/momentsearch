@@ -78,10 +78,11 @@
   <!-- LIBRARY -->
   <section class="bg-card border border-line rounded-2xl p-5 mt-6">
     <div class="flex items-center justify-between flex-wrap gap-3 mb-4">
-      <h2 id="libTitle" class="display text-xl font-600">Your videos</h2>
+      <h2 id="libTitle" class="display text-xl font-600">Your sources</h2>
       <div id="addTabs" class="flex gap-2">
         <span class="tab active" data-tab="yt">YouTube URL</span>
         <span class="tab" data-tab="up">Upload</span>
+        <span class="tab" data-tab="doc">Paper / Deck</span>
       </div>
     </div>
     <div id="addControls">
@@ -94,11 +95,24 @@
         <input id="upFile" type="file" accept="video/*" class="flex-1 min-w-[220px] text-sm">
         <button id="upBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5 py-2.5">Upload &amp; ingest</button>
       </div>
+      <!-- Papers and decks ride the SAME queue as videos: this POST returns 202
+           before a single page is parsed, and a worker does the rest. -->
+      <div id="tab-doc" class="hidden flex gap-2 flex-wrap items-center">
+        <select id="docKind" class="bg-white border border-line rounded-xl px-3 py-2.5 text-sm outline-none focus:border-coral">
+          <option value="paper">Paper</option>
+          <option value="deck">Deck</option>
+        </select>
+        <input id="docUri" type="text" placeholder="https://arxiv.org/pdf/2312.10997"
+          class="flex-1 min-w-[220px] bg-white border border-line rounded-xl px-4 py-2.5 text-sm outline-none focus:border-coral">
+        <input id="docTitle" type="text" placeholder="Title (optional)"
+          class="min-w-[160px] bg-white border border-line rounded-xl px-4 py-2.5 text-sm outline-none focus:border-coral">
+        <button id="docBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5 py-2.5">Ingest</button>
+      </div>
       <div id="ingestStatus" class="text-sm text-muted mt-3 min-h-[20px]"></div>
     </div>
     <div id="videos" class="flex flex-wrap gap-2 mt-2"></div>
     <div id="scopeLine" class="hidden text-xs text-muted mt-3"></div>
-    <p id="libNote" class="text-xs text-muted mt-3">YouTube is searched by picture (frames) and transcript; uploads by picture only for now. First ingest downloads the models.</p>
+    <p id="libNote" class="text-xs text-muted mt-3">YouTube is searched by picture (frames) and transcript; uploads by picture only for now. Papers cite a page, decks a slide. First ingest downloads the models.</p>
   </section>
 
   <!-- RESULTS -->
@@ -150,12 +164,12 @@ const MODE = window.MS_MODE || "sample";   // "sample" (curated, read-only) | "f
 /* ---------- mode-specific framing ---------- */
 function applyMode(){
   if(MODE==="full"){
-    $("#heroBadge").innerHTML='● Bring your own videos';
-    $("#heroTitle").innerHTML='Ask your videos <span class="text-coral">anything</span> you can see.';
-    $("#heroSub").textContent='Add a YouTube URL or upload a file. MomentSearch finds the exact moments — and plays each one right beside the answer.';
+    $("#heroBadge").innerHTML='● Bring your own sources';
+    $("#heroTitle").innerHTML='Ask your library <span class="text-coral">anything</span>.';
+    $("#heroSub").textContent='Add a YouTube URL, upload a file, or point at a paper or deck. MomentSearch finds the exact moment, page or slide — and shows each one right beside the answer.';
     $("#modeLink").textContent='← Back to the sample';     $("#modeLink").href='/';
-    $("#libTitle").textContent='Your videos';
-    $("#libNote").innerHTML='YouTube videos are searched by <b>both</b> what\'s shown (frames) and what\'s said (transcript). Uploaded files are searched by picture only for now — no transcript yet. Tip: unselect the samples to search only your own uploads.';
+    $("#libTitle").textContent='Your sources';
+    $("#libNote").innerHTML='YouTube videos are searched by <b>both</b> what\'s shown (frames) and what\'s said (transcript). Uploaded files are searched by picture only for now — no transcript yet. Papers cite the <b>page</b> they came from and decks the <b>slide</b>. Tip: unselect the samples to search only your own sources.';
   } else {
     $("#heroBadge").innerHTML='● Sample project · four LLM talks, pre-indexed';
     $("#heroTitle").innerHTML='A Deep Dive into <span class="text-coral">LLMs</span>.';
@@ -190,20 +204,29 @@ async function loadConfig(){
     else { b.textContent="No LLM — moments only"; b.className="ml-auto text-xs px-3 py-1 rounded-full border border-[#e7c46a] text-[#8a6d1a] bg-[#fbf2d8]"; }
   }catch{ $("#llmBadge").textContent="API offline"; }
 }
-/* Query scoping: which indexed videos a question searches. Default = all
+/* Query scoping: which indexed sources a question searches. Default = all
    selected; click a chip to include/exclude (e.g. unselect the samples to
-   search only your own uploads). Full mode (/get-started) only. */
+   search only your own uploads). Full mode (/get-started) only.
+
+   One list for every source type: /admin/sources unions the video and document
+   manifests, so a talk, a paper and a deck all appear as chips here and all
+   three are selectable for a single cross-source query. Retrieval already
+   keys documents by their doc_id in the same `video_ids` payload field, so a
+   selected paper scopes the search with no backend special-casing. */
 let SELECTED=new Set(), KNOWN=new Set(), SAMPLE_INDEXED=[];
 const SELECTABLE = ()=> MODE==="full";
-async function loadVideos(){
-  const {videos}=await (await fetch("/api/videos")).json();
+const isDoc=v=>v.kind==="paper"||v.kind==="deck";
+const apiBase=v=>isDoc(v)?"/api/documents/":"/api/videos/";
+async function loadSources(){
+  const {sources}=await (await fetch("/admin/sources")).json();
+  const videos=sources;
   const box=$("#videos");
   // Front page (/) shows & queries ONLY the 4 samples; /get-started shows all.
   const shown = (MODE==="full") ? videos : videos.filter(v=>v.is_sample);
   SAMPLE_INDEXED = videos.filter(v=>v.is_sample && v.status==="indexed").map(v=>v.id);
   if(!shown.length){
     box.innerHTML = MODE==="full"
-      ? '<span class="text-muted text-sm">No videos yet — add one above.</span>'
+      ? '<span class="text-muted text-sm">Nothing yet — add a video, paper or deck above.</span>'
       : '<span class="text-muted text-sm">The four sample talks index themselves on first start — they’ll appear here in a few minutes.</span>';
     return shown;
   }
@@ -213,22 +236,37 @@ async function loadVideos(){
   indexedIds.forEach(id=>{ if(!KNOWN.has(id)){ KNOWN.add(id); SELECTED.add(id); }});
   [...KNOWN].forEach(id=>{ if(!indexedIds.has(id)){ KNOWN.delete(id); SELECTED.delete(id); }});
 
-  const srcLabel=v=>v.is_sample?"sample":(v.source==="youtube"?"YouTube":"upload");
+  const srcLabel=v=>v.is_sample?"sample":(isDoc(v)?v.kind:(v.source==="youtube"?"YouTube":"upload"));
+  // Within-stage percent (sampling 40%). `pct` from the server is the OVERALL
+  // figure and is shown separately on the chip.
   const pct=v=>v.progress?` ${Math.round(v.progress*100)}%`:"";
-  // A leading status indicator so each video's state is obvious at a glance.
+  // What "done" looks like differs by type: frames for a video, pages/slides
+  // and chunk count for a document.
+  function doneLabel(v){
+    if(v.kind==="paper") return `${v.unit_count||0}p · ${v.chunk_count||0} chunks`;
+    if(v.kind==="deck")  return `${v.unit_count||0} slides · ${v.chunk_count||0} chunks`;
+    return `${v.unit_count||0}f · ${srcLabel(v)}`;
+  }
+  // A leading status indicator so each source's state is obvious at a glance.
+  // The document stages (parsing/captioning/chunking) come from
+  // src/ingest/document_pipeline.py; the rest are the video pipeline's.
   function badge(v){
     switch(v.status){
-      case "indexed":   return {icon:"✓", label:`${v.frame_count||0}f · ${srcLabel(v)}`, c:"text-[#1f7a43]"};
-      case "pending":   return {icon:"◷", label:"waiting (fair queue)", c:"text-[#8a6d1a]"};
-      case "queued":    return {icon:"◷", label:"queued",           c:"text-[#8a6d1a]"};
-      case "fetching":  return {icon:"⏬", label:"fetching video…",  c:"text-[#8a6d1a]"};
-      case "sampling":  return {icon:"⏳", label:"sampling"+pct(v),  c:"text-[#8a6d1a]"};
-      case "embedding": return {icon:"⏳", label:"embedding"+pct(v), c:"text-[#8a6d1a]"};
-      case "failed":    return {icon:"⚠", label:"failed",           c:"text-coral2"};
-      case "skipped":   return {icon:"⊘", label:"duplicate",        c:"text-muted"};
-      default:          return {icon:"•", label:v.status,           c:"text-muted"};
+      case "indexed":    return {icon:"✓", label:doneLabel(v),        c:"text-[#1f7a43]"};
+      case "pending":    return {icon:"◷", label:"waiting (fair queue)", c:"text-[#8a6d1a]"};
+      case "queued":     return {icon:"◷", label:"queued",            c:"text-[#8a6d1a]"};
+      case "fetching":   return {icon:"⏬", label:isDoc(v)?"downloading…":"fetching video…", c:"text-[#8a6d1a]"};
+      case "sampling":   return {icon:"⏳", label:"sampling"+pct(v),   c:"text-[#8a6d1a]"};
+      case "parsing":    return {icon:"⏳", label:"parsing…",          c:"text-[#8a6d1a]"};
+      case "captioning": return {icon:"⏳", label:"captioning slides"+pct(v), c:"text-[#8a6d1a]"};
+      case "chunking":   return {icon:"⏳", label:"chunking…",         c:"text-[#8a6d1a]"};
+      case "embedding":  return {icon:"⏳", label:"embedding"+pct(v),  c:"text-[#8a6d1a]"};
+      case "failed":     return {icon:"⚠", label:"failed",            c:"text-coral2"};
+      case "skipped":    return {icon:"⊘", label:"duplicate",         c:"text-muted"};
+      default:           return {icon:"•", label:v.status,            c:"text-muted"};
     }
   }
+  const KIND_ICON={paper:"📄", deck:"🖼"};
   box.innerHTML=shown.map(v=>{
     const indexed=v.status==="indexed";
     const b=badge(v);
@@ -240,12 +278,14 @@ async function loadVideos(){
       ? `<span class="mr-1.5">${sel?"☑":"☐"}</span>`
       : `<span class="mr-1.5 ${b.c}" title="${esc(b.label)}">${b.icon}</span>`;
     const cls="chip"+(toggle&&!sel?" opacity-40":"");
+    // Papers and decks carry a type glyph so a mixed library reads at a glance.
+    const kindIcon=KIND_ICON[v.kind]?`<span class="mr-1" title="${esc(v.kind)}">${KIND_ICON[v.kind]}</span>`:"";
     const retry=(del&&v.status==="failed")
       ? `<button class="ml-2 text-muted hover:text-coral2" data-retry="${esc(v.id)}" title="Retry ingest">↻</button>` : "";
     const trash=(del&&!v.is_sample)
       ? `<button class="ml-2 text-muted hover:text-coral2" data-del="${esc(v.id)}" data-title="${esc(v.title||v.id)}" title="Delete permanently">🗑</button>` : "";
     const attrs=toggle?`data-sel="${esc(v.id)}" title="Click to include or exclude from your search"`:'style="cursor:default"';
-    return `<span class="${cls}" ${attrs}>${lead}${esc(v.title||v.id)} <span class="${b.c}">· ${esc(b.label)}</span>${retry}${trash}</span>`;
+    return `<span class="${cls}" ${attrs} data-kind="${esc(v.kind)}">${lead}${kindIcon}${esc(v.title||v.id)} <span class="${b.c}">· ${esc(b.label)}</span>${retry}${trash}</span>`;
   }).join("");
 
   // clicking a chip toggles include/exclude (but not when a button was clicked)
@@ -253,21 +293,23 @@ async function loadVideos(){
     if(e.target.closest("[data-del],[data-retry]"))return;
     const id=el.dataset.sel;
     SELECTED.has(id)?SELECTED.delete(id):SELECTED.add(id);
-    loadVideos();
+    loadSources();
   });
-  // retry a failed ingest — re-queues it on the worker
+  // retry a failed ingest — re-queues it on the worker. Documents and videos
+  // live in different manifests, so the chip's kind picks the endpoint.
+  const baseFor=el=>apiBase({kind:(el.closest("[data-kind]")||{dataset:{}}).dataset.kind});
   if(del) box.querySelectorAll("[data-retry]").forEach(btn=>btn.onclick=async(e)=>{
     e.stopPropagation();
-    await fetch("/api/videos/"+encodeURIComponent(btn.dataset.retry)+"/retry",{method:"POST"});
-    loadVideos(); startRefresher();
+    await fetch(baseFor(btn)+encodeURIComponent(btn.dataset.retry)+"/retry",{method:"POST"});
+    loadSources(); startRefresher();
   });
   // trash = permanent delete, with a confirm so it's never an accident
   if(del) box.querySelectorAll("[data-del]").forEach(btn=>btn.onclick=async(e)=>{
     e.stopPropagation();
-    if(!confirm(`Delete “${btn.dataset.title}”?\n\nThis permanently removes its frames and search vectors. This can’t be undone.`)) return;
-    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.del),{method:"DELETE"});
+    if(!confirm(`Delete “${btn.dataset.title}”?\n\nThis permanently removes its search vectors and parsed content. This can’t be undone.`)) return;
+    const r=await fetch(baseFor(btn)+encodeURIComponent(btn.dataset.del),{method:"DELETE"});
     if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Delete failed."); return; }
-    KNOWN.delete(btn.dataset.del); SELECTED.delete(btn.dataset.del); loadVideos();
+    KNOWN.delete(btn.dataset.del); SELECTED.delete(btn.dataset.del); loadSources();
   });
 
   // make the user aware of what's actually being searched
@@ -276,7 +318,7 @@ async function loadVideos(){
     const total=indexedIds.size, on=[...SELECTED].filter(id=>indexedIds.has(id)).length;
     scope.classList.remove("hidden");
     scope.innerHTML = total
-      ? `<b>Searching ${on} of ${total} videos.</b> ☑ click a video to include/exclude it · 🗑 delete permanently (samples can’t be deleted).`
+      ? `<b>Searching ${on} of ${total} sources.</b> ☑ click a source to include/exclude it · 🗑 delete permanently (samples can’t be deleted).`
       : "";
   } else { scope.classList.add("hidden"); }
   return videos;
@@ -287,40 +329,49 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active")); t.classList.add("active");
   $("#tab-yt").classList.toggle("hidden",t.dataset.tab!=="yt");
   $("#tab-up").classList.toggle("hidden",t.dataset.tab!=="up");
+  $("#tab-doc").classList.toggle("hidden",t.dataset.tab!=="doc");
 });
 
 /* Ingestion is a QUEUE — register returns 202 instantly and the worker(s)
-   process videos concurrently. So we free the button the moment a video is
+   process sources concurrently. So we free the button the moment a source is
    queued (you can add more right away) and let a single background refresher
-   update the chips until nothing is processing. Per-video progress shows on
-   the chips themselves (sampling… / embedding 40%). */
-const _INFLIGHT=["pending","queued","fetching","sampling","embedding"];
+   update the chips until nothing is processing. Per-source progress shows on
+   the chips themselves (sampling… / parsing… / embedding 40%). The document
+   stages come from the paper/deck flow, which rides the same queue. */
+const _INFLIGHT=["pending","queued","fetching","sampling","parsing",
+                 "captioning","chunking","embedding"];
 let _refresher=null;
 function startRefresher(){
   if(_refresher) return;
   _refresher=setInterval(async()=>{
-    const videos=await loadVideos();
+    const videos=await loadSources();
     if(!videos || !videos.some(v=>_INFLIGHT.includes(v.status))){
       clearInterval(_refresher); _refresher=null;
       $("#ingestStatus").textContent="";
     }
   }, 2500);
 }
-async function registerIngest(body, btns){
+async function registerIngest(body, btns, url="/api/videos"){
   const st=$("#ingestStatus");
   try{
-    const resp=await fetch("/api/videos",{method:"POST",
+    const resp=await fetch(url,{method:"POST",
       headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
     if(!resp.ok){ const e=await resp.json().catch(()=>({})); throw new Error(e.detail||resp.statusText); }
     await resp.json();
     st.textContent="Queued — processing in the background. Add another anytime.";
-    loadVideos(); startRefresher();
+    loadSources(); startRefresher();
   }catch(e){ st.textContent="Error: "+e.message; }
   finally{ btns.forEach(b=>b.disabled=false); }  // free the button immediately
 }
 $("#ytBtn").onclick=()=>{ const u=$("#ytUrl").value.trim(); if(!u)return;
   $("#ytBtn").disabled=true; $("#ytUrl").value="";   // clear so the field is ready for the next URL
   registerIngest({url:u},[$("#ytBtn")]); };
+// A paper or deck by URL — same 202-and-return contract as a video, same queue,
+// same refresher; only the endpoint and the body differ.
+$("#docBtn").onclick=()=>{ const u=$("#docUri").value.trim(); if(!u)return;
+  const kind=$("#docKind").value, title=$("#docTitle").value.trim()||null;
+  $("#docBtn").disabled=true; $("#docUri").value=""; $("#docTitle").value="";
+  registerIngest({uri:u,kind,title},[$("#docBtn")],"/api/documents"); };
 $("#upBtn").onclick=async()=>{ const f=$("#upFile").files[0]; if(!f)return;
   const st=$("#ingestStatus"); $("#upBtn").disabled=true;
   try{
@@ -439,7 +490,7 @@ const EXAMPLES=["a diagram of the attention mechanism","an animation of a neural
 $("#examples").innerHTML=EXAMPLES.map(q=>`<span class="chip">${esc(q)}</span>`).join("");
 $("#examples").querySelectorAll(".chip").forEach(c=>c.onclick=()=>{ qEl.value=c.textContent; autogrow(); qEl.focus(); });
 
-applyMode(); loadConfig(); loadVideos();
+applyMode(); loadConfig(); loadSources();
 </script>
 </body>
 </html>

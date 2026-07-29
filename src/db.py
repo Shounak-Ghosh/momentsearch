@@ -310,6 +310,59 @@ def delete_document(doc_id: str) -> None:
         conn.execute("DELETE FROM ms_documents WHERE id = %s", (doc_id,))
 
 
+# ── Unified source listing (videos + documents) ──────────────────────────────
+# GET /admin/sources needs ONE list across both tables. Same UNION ALL shape the
+# fair claimer below already uses, but projected to a common column set so a
+# caller can render a video, a paper and a deck from one row type. The per-table
+# list_videos/list_documents above stay as they are — the /api/* responses they
+# back must not change (non-negotiable #6).
+
+_SOURCES_SQL = """
+SELECT id, user_id, 'video' AS kind, source, url AS uri, title, status, error,
+       progress, attempts, frame_count AS unit_count, NULL::int AS chunk_count,
+       created_at, updated_at
+  FROM ms_videos    WHERE user_id = %(uid)s
+UNION ALL
+SELECT id, user_id, kind, source, uri, title, status, error,
+       progress, attempts, page_count AS unit_count, chunk_count,
+       created_at, updated_at
+  FROM ms_documents WHERE user_id = %(uid)s
+"""
+
+
+def list_sources(user_id: str, status: str | None = None,
+                 kind: str | None = None) -> list[dict]:
+    """Every source this user owns, newest first, videos and documents pooled.
+
+    `kind` is the literal 'video' for a video row and the document's own
+    'paper'/'deck' — so filtering by kind works uniformly across both tables.
+    """
+    q = f"SELECT * FROM ({_SOURCES_SQL}) s"
+    params: dict[str, Any] = {"uid": user_id}
+    where = []
+    if status:
+        where.append("s.status = %(status)s")
+        params["status"] = status
+    if kind:
+        where.append("s.kind = %(kind)s")
+        params["kind"] = kind
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY s.created_at DESC"
+    with pool().connection() as conn:
+        return conn.execute(q, params).fetchall()
+
+
+def get_source(user_id: str, source_id: str) -> dict | None:
+    """One of this user's sources by id, from whichever table owns it (id
+    prefixes don't collide: yt_/up_ are videos, doc_ are documents)."""
+    with pool().connection() as conn:
+        return conn.execute(
+            f"SELECT * FROM ({_SOURCES_SQL}) s WHERE s.id = %(id)s",
+            {"uid": user_id, "id": source_id},
+        ).fetchone()
+
+
 # ── Fair scheduling (WFQ) ────────────────────────────────────────────────────
 # Fair across BOTH source types: a user backfilling 40 papers can't starve a
 # user adding one video, and vice versa — the round-robin partitions by

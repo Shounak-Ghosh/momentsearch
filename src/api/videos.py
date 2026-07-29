@@ -114,6 +114,16 @@ class RegisterRequest(BaseModel):
     title: str | None = None
 
 
+def _enqueue(video_id: str, uid: str) -> str:
+    """Schedule the queue run, reporting an unreachable Prefect as a 502
+    (upstream failure) instead of a bare 500. Only reached with fair dispatch
+    OFF; with it on (the default) the request path never calls Prefect."""
+    try:
+        return jobs.enqueue_video(video_id, uid)
+    except Exception as exc:
+        raise HTTPException(502, f"Could not reach the work queue: {exc}") from exc
+
+
 @router.post("", status_code=202, dependencies=[Depends(require_auth)])
 def register(req: RegisterRequest, uid: str = Depends(user_id)):
     if req.url:
@@ -145,7 +155,7 @@ def register(req: RegisterRequest, uid: str = Depends(user_id)):
     # order (src/dispatcher.py). FIFO mode: enqueue to Prefect immediately.
     if config.ENABLE_FAIR_DISPATCH:
         return {"video_id": row["id"], "status": "pending"}
-    flow_run_id = jobs.enqueue_video(row["id"], uid)
+    flow_run_id = _enqueue(row["id"], uid)
     return {"video_id": row["id"], "status": row["status"], "flow_run_id": flow_run_id}
 
 
@@ -184,7 +194,7 @@ def retry(video_id: str, uid: str = Depends(user_id)):
     db.set_status(video_id, "pending", error=None)
     if config.ENABLE_FAIR_DISPATCH:
         return {"video_id": video_id, "status": "pending"}  # dispatcher re-admits it fairly
-    flow_run_id = jobs.enqueue_video(video_id, uid)
+    flow_run_id = _enqueue(video_id, uid)
     return {"video_id": video_id, "status": "pending", "flow_run_id": flow_run_id}
 
 
