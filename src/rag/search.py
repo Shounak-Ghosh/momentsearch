@@ -19,8 +19,9 @@ from ..config import (BRANCH_TOP_K, CONFIDENCE_THRESHOLD, CROSS_MODAL_BOOST,
 from . import vector_store
 from .embeddings import embed_query, embed_text
 
-ABSTAIN = ("I couldn't find that in your videos — nothing indexed looks "
-           "related to the question (neither what's on screen nor what's said).")
+ABSTAIN = ("I couldn't find that in what's indexed — nothing in your videos, "
+           "papers, or decks looks related to the question (neither what's on "
+           "screen, what's said, nor what's written).")
 
 
 def _seconds(ms: int) -> str:
@@ -54,9 +55,13 @@ def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
     on its own and score by rank: rrf = 1/(RRF_K + rank). Video hits bucket by
     FUSION_WINDOW_S seconds of each other (same video) into one 'moment';
     page/slide hits bucket by their exact locator (_locator_key) instead, since
-    they have no timeline to bucket by. Either way, hits landing in the same
-    window sum their rrf, boosted when BOTH modalities agree — two independent
-    signals pointing at the same instant is the strongest evidence.
+    they have no timeline to bucket by. Either way, a window's score is the
+    MEAN rrf of the branches that hit there, boosted when BOTH modalities
+    agree — two independent signals pointing at the same instant is the
+    strongest evidence. (Averaging rather than summing keeps a frame-less
+    paper/deck window comparable to a text-only video window instead of
+    structurally capped below it — see the comment at the bottom of this
+    function.) Finally capped per-source so one source can't fill every slot.
     """
     def ranked(hits, modality):
         out = []
@@ -91,16 +96,42 @@ def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
         if w[slot] is None:
             w[slot] = h
     for w in windows:
-        # Score = best frame + best transcript hit; ×boost when BOTH modalities
-        # agree at this instant (two independent signals = strongest evidence).
-        # Paper/deck windows never have a frame hit, so this boost never fires
-        # for them — correct, there's no second modality to agree with.
-        w["rrf"] = (w["frame"]["rrf"] if w["frame"] else 0.0) + \
-                   (w["text"]["rrf"] if w["text"] else 0.0)
+        # Score = MEAN of the branches that actually hit here (not their sum),
+        # ×boost when BOTH modalities agree at this instant (two independent
+        # signals = strongest evidence). Paper/deck windows structurally never
+        # have a frame branch — summing would peg them ~2-3x below a
+        # comparable video window for a modality they can't have; averaging
+        # puts a doc window and a text-only video window on equal footing,
+        # and the boost stays a bonus a video EARNS, not a handicap a
+        # single-modality source can never overcome.
+        contribs = [h["rrf"] for h in (w["frame"], w["text"]) if h is not None]
+        w["rrf"] = (sum(contribs) / len(contribs)) if contribs else 0.0
         if {"frame", "text"} <= w["modalities"]:
             w["rrf"] *= CROSS_MODAL_BOOST
     windows.sort(key=lambda w: w["rrf"], reverse=True)
-    return windows
+    return _cap_per_source(windows, config.MAX_CITATIONS_PER_SOURCE)
+
+
+def _cap_per_source(windows: list[dict], cap: int) -> list[dict]:
+    """Keep at most `cap` windows per source (video_id) in the top ranks, then
+    append the overflow (still in its original rank order) after them. A
+    single chatty video or a 60-page paper can otherwise fill every TOP_K slot
+    on a mixed corpus — this keeps the top of the list source-diverse without
+    ever dropping a window outright (overflow still counts if fewer than TOP_K
+    sources survive the cap). `cap <= 0` disables it."""
+    if not cap:
+        return windows
+    kept: list[dict] = []
+    overflow: list[dict] = []
+    counts: dict[str, int] = {}
+    for w in windows:
+        vid = w["video_id"]
+        if counts.get(vid, 0) < cap:
+            kept.append(w)
+            counts[vid] = counts.get(vid, 0) + 1
+        else:
+            overflow.append(w)
+    return kept + overflow
 
 
 def _deeplink(video: dict | None, video_id: str, ms: int) -> str:
@@ -172,11 +203,16 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
         # seek); otherwise the transcript chunk's start.
         ms = int(fr["ms"]) if fr else int(w["t"] * 1000)
         idx = int(fr["idx"]) if fr else None
+        # end_ms rides through from the transcript chunk's t_end (pipeline.py's
+        # payload always carries it); a frame-only window has no span, so its
+        # citation is a point in time, not a range.
+        end_ms = int(tx["t_end"] * 1000) if tx and tx.get("t_end") is not None else ms
         citations.append({
             "n": i,
             "video_id": vid,
+            "sourceId": vid,  # spec alias — same id, additive so the UI keeps reading video_id
             "kind": "video",
-            "locator": {"start_ms": ms},
+            "locator": {"start_ms": ms, "end_ms": end_ms},
             "title": (meta or {}).get("title") or vid,
             "url": (meta or {}).get("url"),
             "source": (meta or {}).get("source"),
@@ -193,6 +229,20 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
     return {"citations": citations, "best_visual": best_visual, "best_text": best_text}
 
 
+def _doc_file_url(meta: dict, doc_id: str, user_id: str) -> str | None:
+    """Same-origin URL to OUR archived copy of the document — set iff we
+    actually hold the bytes (meta['storage_key'], written by t_fetch_doc
+    after a successful archive upload). Deliberately NOT a storage.exists()
+    check: that would be a HEAD request per citation on the hot search path
+    (up to TOP_K of them), and the Postgres row is already in hand from
+    documents_by_ids(), so this costs nothing. Documents ingested before the
+    storage_key write-back land here as None and fall through to the
+    external `url` in the UI."""
+    if not meta.get("storage_key"):
+        return None
+    return f"/api/documents/{doc_id}/file?u={user_id}"
+
+
 def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
     """A paper/deck 'moment' has no frame and no timestamp — its locator is
     the page or slide it was retrieved from, real because it rides straight
@@ -201,6 +251,7 @@ def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
     kind = w.get("kind")
     tx = w["text"] or {}
     uri = meta.get("uri")
+    file_url = _doc_file_url(meta, w["video_id"], user_id)
     if kind == "deck":
         slide = w.get("slide")
         thumbnail = None
@@ -219,11 +270,13 @@ def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
         return {
             "n": n,
             "video_id": w["video_id"],
+            "sourceId": w["video_id"],  # spec alias — same id, additive
             "kind": "deck",
             "locator": {"slide": slide},
             "slide": slide,
             "title": meta.get("title") or tx.get("title") or w["video_id"],
             "url": uri,
+            "file_url": file_url,
             "source": meta.get("source"),
             "timestamp": f"Slide {slide}" if slide else "",
             "idx": None,
@@ -246,11 +299,13 @@ def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
     return {
         "n": n,
         "video_id": w["video_id"],
+        "sourceId": w["video_id"],  # spec alias — same id, additive
         "kind": "paper",
         "locator": {"page": page},
         "page": page,
         "title": meta.get("title") or tx.get("title") or w["video_id"],
         "url": uri,
+        "file_url": file_url,
         "source": meta.get("source"),
         "timestamp": f"p. {page}" if page else "",
         "idx": None,
@@ -266,12 +321,12 @@ def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
 
 
 def _fallback_answer(citations: list[dict[str, Any]]) -> str:
-    """No-LLM summary: rank the visually-closest moments. Honest about being
-    similarity, not synthesis."""
+    """No-LLM summary: rank the closest-matching moments across every source
+    (video, paper, deck). Honest about being similarity, not synthesis."""
     top = citations[0]
     where = f"{top['title']} at {top['timestamp']}" if top.get("title") else top["timestamp"]
     others = ", ".join(f"{c['timestamp']} [{c['n']}]" for c in citations[1:4])
-    msg = f"Closest visual match: {where} [{top['n']}] (similarity {top['score']})."
+    msg = f"Closest match: {where} [{top['n']}] (similarity {top['score']})."
     if others:
         msg += f" Other relevant moments: {others}."
     return msg
@@ -280,18 +335,22 @@ def _fallback_answer(citations: list[dict[str, Any]]) -> str:
 _CITE_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
-def _validate_citations(answer: str, n_frames: int) -> str:
-    """Strip invented [n] references the model has no frame for."""
+def _validate_citations(answer: str, n_citations: int) -> str:
+    """Strip invented [n] references the model has no moment for."""
     def fix(m: re.Match) -> str:
         nums = [int(x) for x in re.split(r"\s*,\s*", m.group(1))]
-        valid = [str(x) for x in nums if 1 <= x <= n_frames]
+        valid = [str(x) for x in nums if 1 <= x <= n_citations]
         return f"[{', '.join(valid)}]" if valid else ""
     return _CITE_RE.sub(fix, answer)
 
 
 def _build_moments(user_id: str, citations: list[dict[str, Any]]) -> list[dict]:
     """Turn citations into what the LLM sees: each moment carries its frame
-    image (if any) and/or its transcript excerpt (if any), numbered to match."""
+    image (if any), its text excerpt (if any), and the source metadata
+    (kind/title/page/slide) — without this the model only ever sees the
+    opaque `timestamp` string ("p. 4") and has to GUESS it's a page rather
+    than being told, which is exactly the gap where an invented locator
+    could slip in."""
     def frame_bytes(c):
         if c.get("idx") is None:
             return None
@@ -302,8 +361,10 @@ def _build_moments(user_id: str, citations: list[dict[str, Any]]) -> list[dict]:
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         images = list(ex.map(frame_bytes, citations))
-    return [{"image": img, "transcript": c.get("transcript"),
-             "timestamp": c["timestamp"]} for img, c in zip(images, citations)]
+    return [{"image": img, "transcript": c.get("transcript"), "timestamp": c["timestamp"],
+             "kind": c.get("kind"), "title": c.get("title"),
+             "page": c.get("page"), "slide": c.get("slide")}
+            for img, c in zip(images, citations)]
 
 
 def resolve_llm(user_id: str) -> tuple[llm.LLMConfig | None, str]:
@@ -318,39 +379,74 @@ def resolve_llm(user_id: str) -> tuple[llm.LLMConfig | None, str]:
     return (cfg, "server") if cfg else (None, "none")
 
 
-def ask(question: str, user_id: str, *, top_k: int | None = None,
-        video_id: str | None = None,
-        video_ids: list[str] | None = None) -> dict[str, Any]:
+def ask_events(question: str, user_id: str, *, top_k: int | None = None,
+               video_id: str | None = None, video_ids: list[str] | None = None):
+    """Generator form of ask(): yields (event, payload) tuples in the exact
+    order /ask_stream streams them to the client — trace, citations, token*,
+    done. The confidence gate, the no-LLM fallback, and citation validation
+    all live HERE and only here; ask() below is a thin consumer, and so is
+    the SSE route, so both get identical grounding guarantees and can never
+    drift apart.
+
+    Citations are always yielded BEFORE any answer token — that ordering IS
+    the grounding guarantee made visible: every locator the client can see
+    came from retrieval, before the model said a word.
+    """
+    yield ("trace", {"stage": "retrieving"})
     r = retrieve(question, user_id, top_k=top_k, video_id=video_id, video_ids=video_ids)
     citations = r["citations"]
-    result: dict[str, Any] = {"question": question, "citations": citations}
+    yield ("trace", {"stage": "retrieved", "n": len(citations),
+                      "kinds": sorted({c["kind"] for c in citations}),
+                      "best_visual": r["best_visual"], "best_text": r["best_text"]})
+    yield ("citations", {"citations": citations})
 
     if not citations:
-        result.update(answer="No relevant moments were found. Try ingesting a video first.",
-                      llm_used=False, abstained=True)
-        return result
+        yield ("done", {"answer": "No relevant moments were found. Try ingesting a video first.",
+                         "llm_used": False, "abstained": True})
+        return
 
     # Gate 1 — confidence on the RAW per-branch bests (not the RRF score).
-    # Abstain only if NEITHER what's on screen nor what's said looks relevant.
+    # Abstain only if NEITHER what's on screen nor what's said/written looks relevant.
     visual_ok = r["best_visual"] >= CONFIDENCE_THRESHOLD
     text_ok = r["best_text"] >= TEXT_CONFIDENCE_THRESHOLD
     if CONFIDENCE_THRESHOLD and not visual_ok and not text_ok:
-        result.update(answer=ABSTAIN, llm_used=False, abstained=True)
-        return result
+        yield ("done", {"answer": ABSTAIN, "llm_used": False, "abstained": True})
+        return
 
     cfg, source = resolve_llm(user_id)
     if cfg is None:
         # No generative model — summarize the best matches instead of inventing.
-        result.update(answer=_fallback_answer(citations), llm_used=False,
-                      note=("Retrieval-only results. Connect your own model "
-                            "(vLLM/Ollama/API) in settings, or set LLM_API_KEY "
-                            "on the server, for a synthesized, grounded answer."))
-        return result
+        yield ("done", {
+            "answer": _fallback_answer(citations), "llm_used": False,
+            "note": ("Retrieval-only results. Connect your own model "
+                     "(vLLM/Ollama/API) in settings, or set LLM_API_KEY "
+                     "on the server, for a synthesized, grounded answer."),
+        })
+        return
 
     moments = _build_moments(user_id, citations)
-    result["answer"] = _validate_citations(llm.answer(question, moments, cfg),
-                                           len(citations))
-    result["llm_used"] = True
-    result["llm_source"] = source          # "user" = their own hosted model
-    result["llm_model"] = cfg.model
+    chunks: list[str] = []
+    for delta in llm.answer_stream(question, moments, cfg):
+        chunks.append(delta)
+        yield ("token", {"t": delta})
+    validated = _validate_citations("".join(chunks), len(citations))
+    yield ("done", {"answer": validated, "llm_used": True,
+                     "llm_source": source, "llm_model": cfg.model})
+
+
+def ask(question: str, user_id: str, *, top_k: int | None = None,
+        video_id: str | None = None,
+        video_ids: list[str] | None = None) -> dict[str, Any]:
+    """Blocking read path: retrieve -> confidence gate -> cited answer (or
+    honest abstain). Folds ask_events() into the single response dict
+    POST /api/ask has always returned — same shape, now sourced from the one
+    generator /ask_stream also consumes, instead of a parallel copy of the
+    same logic."""
+    result: dict[str, Any] = {"question": question}
+    for event, payload in ask_events(question, user_id, top_k=top_k,
+                                      video_id=video_id, video_ids=video_ids):
+        if event == "citations":
+            result["citations"] = payload["citations"]
+        elif event == "done":
+            result.update(payload)
     return result

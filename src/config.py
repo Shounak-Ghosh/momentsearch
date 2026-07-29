@@ -314,6 +314,10 @@ QDRANT_HNSW_ON_DISK = _envbool("QDRANT_HNSW_ON_DISK", True)
 # --- Retrieval / faithfulness ------------------------------------------------------
 TOP_K = _int("TOP_K", 6)                 # frames fed to the multimodal LLM (3-8)
 KNN_K = _int("KNN_K", 24)                # candidates fetched before trimming to TOP_K
+# Cross-source diversity cap: at most this many citations from any one source
+# (video/paper/deck) survive fusion, so a long paper or a single video can't
+# monopolize every TOP_K slot on a mixed corpus. 0 disables the cap.
+MAX_CITATIONS_PER_SOURCE = _int("MAX_CITATIONS_PER_SOURCE", 3)
 # Gate 1: abstain WITHOUT calling the LLM if BOTH branches' best raw score is
 # below their threshold. Fusion scores are RRF (tiny), so the gate uses each
 # branch's own raw cosine. CLIP text->image cosines run low (~0.2-0.35); bge

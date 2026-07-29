@@ -1,12 +1,15 @@
 """Search API (read path) + UI + local-dev media serving.
 
-POST /api/ask is the whole read path: retrieve -> confidence gate -> cited
-multimodal answer or honest abstention (src/rag/search.py). Media endpoints
-exist only for STORAGE_PROVIDER=local — with a real bucket, thumbnails and
-playback stream via presigned URLs and never touch this process.
+POST /api/ask and GET /ask_stream are the same read path — retrieve ->
+confidence gate -> cited multimodal answer or honest abstention
+(src/rag/search.py's ask_events()) — one blocking, one SSE so citations reach
+the client before a single answer token. Media endpoints exist only for
+STORAGE_PROVIDER=local — with a real bucket, thumbnails and playback stream
+via presigned URLs and never touch this process.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -148,6 +151,49 @@ def ask(req: AskRequest, x_user_id: str | None = Header(default=None)):
     return rag_search.ask(req.question.strip(), _uid(x_user_id),
                           top_k=req.top_k, video_id=req.video_id,
                           video_ids=video_ids)
+
+
+def _sse(event: str, payload: dict) -> str:
+    # A bare "data: ...\n\n" defaults to a client-side "message" event; naming
+    # it explicitly is what lets the UI's EventSource listen per event type
+    # (citations vs token vs done) instead of parsing a tagged envelope.
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+
+@router.get("/ask_stream")
+def ask_stream(q: str, u: str | None = None, video_id: str | None = None,
+               video_ids: str | None = None, top_k: int | None = None):
+    """SSE form of /api/ask: trace -> citations -> token* -> done (or error).
+
+    Citations arrive before any answer token — the client can render source
+    cards while the model is still generating, and that ordering is the
+    grounding guarantee made visible: every locator on screen came from
+    retrieval, not from the model. EventSource can't set headers, so the
+    tenant travels as `u` (same convention as the frame/slide/page/video
+    endpoints below) instead of X-User-Id.
+    """
+    if not q.strip():
+        raise HTTPException(400, "Empty question.")
+    uid = _uid(u)
+    # Empty/absent -> None -> "all videos", same convention as POST /api/ask.
+    ids = [v for v in video_ids.split(",") if v] if video_ids else None
+
+    def gen():
+        try:
+            for event, payload in rag_search.ask_events(
+                q.strip(), uid, top_k=top_k, video_id=video_id, video_ids=ids,
+            ):
+                yield _sse(event, payload)
+        except Exception as exc:
+            # Headers are already flushed by the time an upstream (LLM) call
+            # fails mid-stream, so a real 502 isn't possible here — the error
+            # rides in the event body instead. POST /api/ask (no streaming
+            # started yet) still raises a normal exception -> FastAPI 500.
+            yield _sse("error", {"error": str(exc)})
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 # ── Media (local-dev only; buckets serve these via presigned URLs) ───────────

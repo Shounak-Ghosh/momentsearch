@@ -22,6 +22,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 
 from .. import config, db, jobs, storage
@@ -193,6 +194,49 @@ def get_document(doc_id: str, uid: str = Depends(user_id)):
     if row is None or row["user_id"] != uid:
         raise HTTPException(404, "Document not found.")
     return _public(row)
+
+
+# ── File (the archived raw PDF/PPTX, same-origin) ─────────────────────────────
+# Citations for papers/decks embed the ORIGINAL external `url` too, but that
+# never works for uploads (no public URL) and silently blanks under some
+# hosts' X-Frame-Options (arxiv.org included) — the browser gives no JS error
+# when that happens, it just renders an empty iframe. Serving our own archived
+# copy same-origin sidesteps both: no cross-origin framing policy applies, and
+# uploads have bytes to serve. An <iframe>/<embed src> can't attach an auth
+# header, so — same pattern as the frame/slide/page/video endpoints in
+# api/search.py — the tenant rides in the `u` query param, not X-User-Id.
+_USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _media_uid(value: str | None) -> str:
+    uid = (value or config.DEFAULT_USER_ID).strip()
+    if not _USER_RE.match(uid):
+        raise HTTPException(400, "Invalid user id.")
+    return uid
+
+
+@router.get("/{doc_id}/file")
+def file(doc_id: str, u: str | None = None):
+    uid = _media_uid(u)
+    row = db.get_document(doc_id)
+    # storage_key is only set once t_fetch_doc has confirmed the archive
+    # exists (written after a successful upload/reuse — see
+    # ingest/document_pipeline.py's t_fetch_doc). A document mid-ingest, or
+    # ingested before that write-back landed, has none: 404 here, and the
+    # citation's file_url is already None for it (search.py's
+    # _doc_file_url), so the UI falls through to the external `url` instead.
+    if row is None or row["user_id"] != uid or not row.get("storage_key"):
+        raise HTTPException(404, "Document not found.")
+    if storage.presign_capable():
+        return RedirectResponse(storage.presign_get(row["storage_key"]), status_code=307)
+    path = storage.local_path(row["storage_key"])
+    if not path.exists():
+        raise HTTPException(404, "Document file not found.")
+    media_type = ("application/pdf" if doc_ext(row) == ".pdf" else
+                 "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    return FileResponse(path, media_type=media_type,
+                        headers={"Content-Disposition": "inline",
+                                 "Cache-Control": "public, max-age=86400"})
 
 
 @router.post("/{doc_id}/retry", status_code=202, dependencies=[Depends(require_auth)])

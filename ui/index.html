@@ -394,26 +394,91 @@ function autogrow(){ qEl.style.height="auto"; qEl.style.height=Math.min(qEl.scro
 qEl.addEventListener("input",autogrow);
 qEl.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); $("#go").click(); }});
 
-$("#go").onclick=async()=>{
+$("#go").onclick=()=>{
   const q=qEl.value.trim(); if(!q)return;
   $("#resultsWrap").classList.remove("hidden");
   $("#article").innerHTML=`<div class="space-y-3"><div class="shimmer h-6 w-2/3 rounded"></div><div class="shimmer h-4 w-full rounded"></div><div class="shimmer h-4 w-5/6 rounded"></div></div>`;
   $("#sources").innerHTML=""; $("#go").disabled=true; $("#go").textContent="…";
-  try{
-    // Front page (/) queries ONLY the samples; /get-started queries the selected set.
-    const video_ids = SELECTABLE() ? [...SELECTED] : SAMPLE_INDEXED;
-    const r=await (await fetch("/api/ask",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({question:q, video_ids})})).json();
-    CITES=r.citations||[];
-    let html="";
-    if(r.answer) html+=`<div class="prose-body fade-in">${renderMarkdown(r.answer)}</div>`;
-    if(r.note) html+=`<p class="text-xs text-muted mt-3">${esc(r.note)}</p>`;
-    if(!r.answer && !CITES.length) html=`<p class="text-muted">No matching moments. Add a video first.</p>`;
-    $("#article").innerHTML=html;
-    renderSources();
-  }catch(e){ $("#article").innerHTML=`<p class="text-coral2">Error: ${esc(e.message)}</p>`; }
-  finally{ $("#go").disabled=false; $("#go").textContent="→"; }
+  // Front page (/) queries ONLY the samples; /get-started queries the selected set.
+  const video_ids = SELECTABLE() ? [...SELECTED] : SAMPLE_INDEXED;
+  askStream(q, video_ids);
 };
+
+function noMomentsHtml(){ return `<p class="text-muted">No matching moments. Add a video first.</p>`; }
+
+/* Blocking fallback — the request the UI made before /ask_stream existed.
+   Used only when the SSE connection fails before a single event has landed
+   (e.g. a proxy that doesn't pass through text/event-stream), so asking
+   still completes instead of just hanging. */
+function askViaFetch(q, video_ids){
+  fetch("/api/ask",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({question:q, video_ids})})
+    .then(r=>r.json())
+    .then(r=>{
+      CITES=r.citations||[];
+      let html="";
+      if(r.answer) html+=`<div class="prose-body fade-in">${renderMarkdown(r.answer)}</div>`;
+      if(r.note) html+=`<p class="text-xs text-muted mt-3">${esc(r.note)}</p>`;
+      if(!r.answer && !CITES.length) html=noMomentsHtml();
+      $("#article").innerHTML=html;
+      renderSources();
+    })
+    .catch(e=>{ $("#article").innerHTML=`<p class="text-coral2">Error: ${esc(e.message)}</p>`; })
+    .finally(()=>{ $("#go").disabled=false; $("#go").textContent="→"; });
+}
+
+/* SSE ask: trace -> citations -> token* -> done (or error). Citations paint
+   the source cards as soon as they arrive, BEFORE a single answer token —
+   that's the grounding guarantee (src/rag/search.py's ask_events) made
+   visible: everything cited on screen came from retrieval, not the model. */
+function askStream(q, video_ids){
+  const params=new URLSearchParams({q});
+  if(video_ids && video_ids.length) params.set("video_ids", video_ids.join(","));
+  const es=new EventSource(`/ask_stream?${params}`);
+  let gotEvent=false, buf="";
+  const finish=()=>{ es.close(); $("#go").disabled=false; $("#go").textContent="→"; };
+
+  es.addEventListener("citations", e=>{
+    gotEvent=true;
+    CITES=JSON.parse(e.data).citations||[];
+    renderSources();
+    $("#article").innerHTML = CITES.length
+      ? `<div class="prose-body fade-in" id="streamAnswer"></div>` : noMomentsHtml();
+  });
+  es.addEventListener("token", e=>{
+    gotEvent=true;
+    buf += JSON.parse(e.data).t||"";
+    const el=$("#streamAnswer");
+    if(el) el.innerHTML=renderMarkdown(buf);   // re-render throttled by SSE's own delivery rate
+  });
+  es.addEventListener("done", e=>{
+    gotEvent=true;
+    const d=JSON.parse(e.data);
+    let html="";
+    if(d.answer) html+=`<div class="prose-body fade-in">${renderMarkdown(d.answer)}</div>`;
+    if(d.note) html+=`<p class="text-xs text-muted mt-3">${esc(d.note)}</p>`;
+    if(!d.answer && !CITES.length) html=noMomentsHtml();
+    $("#article").innerHTML=html;
+    finish();
+  });
+  es.addEventListener("error", e=>{
+    if(e.data===undefined){
+      // A real connection failure (EventSource's own error, not our named
+      // SSE event) — no `.data`. If nothing rendered yet, fall back to the
+      // blocking endpoint; if we're mid-stream, stop rather than restart
+      // and risk a duplicate/garbled answer.
+      finish();
+      if(!gotEvent) askViaFetch(q, video_ids);
+      else $("#article").innerHTML += `<p class="text-coral2 mt-2">Connection lost.</p>`;
+      return;
+    }
+    gotEvent=true;
+    let msg="Something went wrong.";
+    try{ msg=JSON.parse(e.data).error||msg; }catch(_){}
+    $("#article").innerHTML += `<p class="text-coral2 mt-2">Error: ${esc(msg)}</p>`;
+    finish();
+  });
+}
 
 function renderSources(){
   $("#sources").innerHTML=CITES.map(c=>{
@@ -463,7 +528,7 @@ function playCitation(n){
   $("#modal").classList.remove("hidden"); document.body.style.overflow="hidden";
 }
 function renderVideoPlayer(c, box){
-  const secs=Math.floor((c.ms||0)/1000);
+  const secs=Math.floor((c.locator?.start_ms ?? c.ms ?? 0)/1000);
   $("#mMeta").textContent = c.transcript ? `“${c.transcript}”` : `Moment at ${c.timestamp}`;
   const yid=ytId(c);
   // Frame preview if we have one; otherwise (text-only YouTube moment) the
@@ -485,37 +550,78 @@ function renderVideoPlayer(c, box){
     if(v.readyState>=1) seek(); else v.addEventListener("loadedmetadata",seek,{once:true});
   }
 }
+/* Best-effort embed of a CROSS-ORIGIN document URL. Real detection of an
+   X-Frame-Options block is impossible from script (Same-Origin Policy blocks
+   reading a successfully-cross-origin-loaded frame's contents — there's no
+   error event for a refused frame either), so this combines two heuristics:
+   a load timeout, and the fact that a REFUSED navigation typically leaves the
+   iframe at "about:blank", which — unlike the real cross-origin document —
+   the parent CAN read. Neither is airtight (some hosts redirect same-origin
+   before refusing, which this can't catch), which is exactly why file_url
+   (OUR archived copy, same-origin, no framing policy involved) is tried
+   first in renderDocPlayer and this is only the fallback for documents
+   ingested before that existed. */
+function tryEmbedExternal(url, n, box, onFail){
+  const iframe=document.createElement("iframe");
+  iframe.className="w-full h-full bg-white";
+  iframe.title="document page";
+  let settled=false;
+  const fail=()=>{ if(settled)return; settled=true; onFail(); };
+  const timer=setTimeout(fail,2500);
+  iframe.onerror=()=>{ clearTimeout(timer); fail(); };
+  iframe.onload=()=>{
+    clearTimeout(timer);
+    if(settled)return;
+    try{
+      if(iframe.contentWindow && iframe.contentWindow.location.href==="about:blank"){ fail(); return; }
+    }catch(_){ /* threw -> the frame actually navigated cross-origin -> success */ }
+    settled=true;
+  };
+  iframe.src=`${url}#page=${n}`;
+  box.innerHTML=""; box.appendChild(iframe);
+}
 function renderDocPlayer(c, box){
   const locatorLabel = c.kind==="deck" ? "Slide" : "Page";
   const n = c.kind==="deck" ? c.slide : c.page;
   $("#mMeta").textContent = c.transcript ? `“${c.transcript}”` : `${locatorLabel} ${n||"?"}`;
-  // Inline PDF embed only for URL-sourced PDFs — uploads have no public URL,
-  // and some hosts send X-Frame-Options that silently blank the iframe (no JS
-  // error fires when that happens), so this is a best-effort upgrade, never
-  // the only content: the footer thumbnail strip below always carries the
-  // rendered snippet as a fallback.
-  // A paper is ALWAYS a PDF (ingestion contract), so no extension check is
-  // needed there. A deck can be PDF or PPTX, and its URL isn't guaranteed to
-  // end in ".pdf" (e.g. arxiv-style links like .../pdf/2312.10997 have no
-  // extension at all) — ruling out ".pptx" (the only other deck format) is
-  // the robust check, not requiring ".pdf".
-  const isPptx = (c.url||"").toLowerCase().split("?")[0].endsWith(".pptx");
-  const canEmbed = c.source!=="upload" && (c.kind==="paper" || !isPptx);
-  if(canEmbed){
-    box.innerHTML=`<iframe class="w-full h-full bg-white" src="${esc(c.url)}#page=${n}" title="document page"></iframe>`;
-  } else if(c.thumbnail){
-    box.innerHTML=`<img class="w-full h-full object-contain bg-white" src="${esc(c.thumbnail)}" alt="${locatorLabel} ${n}">`;
-  } else {
-    // No render available (old doc ingested before this, or past the render
-    // cap) — text-forward fallback, never an empty box.
-    box.innerHTML=`<div class="w-full h-full flex items-center justify-center bg-paper2 p-6 text-center">
-      <div class="max-w-md text-sm text-ink italic">“${esc(c.text||c.transcript||"")}”</div>
-    </div>`;
-  }
   $("#mFrame").style.display = c.thumbnail ? "" : "none";
   if(c.thumbnail) $("#mFrame").src = c.thumbnail;
   $("#mFrameLabel").textContent = c.kind==="deck" ? "Matched slide" : "Matched page";
   $("#mFrameDesc").textContent = `This ${locatorLabel.toLowerCase()} matched on its text — press “Open on source” to view the original document.`;
+
+  const showThumbOrText=()=>{
+    if(c.thumbnail){
+      box.innerHTML=`<img class="w-full h-full object-contain bg-white" src="${esc(c.thumbnail)}" alt="${locatorLabel} ${n}">`;
+    } else {
+      // No render available (old doc ingested before this, or past the
+      // render cap) — text-forward fallback, never an empty box.
+      box.innerHTML=`<div class="w-full h-full flex items-center justify-center bg-paper2 p-6 text-center">
+        <div class="max-w-md text-sm text-ink italic">“${esc(c.text||c.transcript||"")}”</div>
+      </div>`;
+    }
+  };
+
+  // Browsers have no native PPTX viewer — a PPTX deck (a URL's extension is
+  // the only reliable signal; a paper is ALWAYS a PDF by ingestion contract,
+  // so this check only ever applies to decks) skips straight to the
+  // thumbnail regardless of which URL we'd otherwise embed.
+  const isPptx = (c.url||"").toLowerCase().split("?")[0].endsWith(".pptx");
+  if(c.kind==="deck" && isPptx){ showThumbOrText(); return; }
+
+  if(c.file_url){
+    // Step 1: OUR archived copy, same-origin — no X-Frame-Options can apply,
+    // and this works for uploads too (they have no public `url` at all).
+    box.innerHTML=`<iframe class="w-full h-full bg-white" src="${esc(c.file_url)}#page=${n}" title="document page"></iframe>`;
+    return;
+  }
+  if(c.url && c.source!=="upload"){
+    // Step 2: the external URL, kept for documents ingested before file_url
+    // existed — best-effort embed, see tryEmbedExternal for the caveats.
+    tryEmbedExternal(c.url, n, box, showThumbOrText);
+    return;
+  }
+  // Step 3/4: thumbnail, else the text excerpt.
+  showThumbOrText();
 }
 function closeModal(){ $("#playerBox").innerHTML=""; $("#modal").classList.add("hidden"); document.body.style.overflow=""; }
 $("#mClose").onclick=closeModal;

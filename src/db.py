@@ -233,7 +233,8 @@ def set_doc_status(doc_id: str, status: str, *, error: str | None = None,
                    title: str | None = None, page_count: int | None = None,
                    chunk_count: int | None = None, source_hash: str | None = None,
                    embed_version: str | None = None,
-                   progress: float | None = None) -> None:
+                   progress: float | None = None,
+                   storage_key: str | None = None) -> None:
     with pool().connection() as conn:
         conn.execute(
             """
@@ -244,11 +245,12 @@ def set_doc_status(doc_id: str, status: str, *, error: str | None = None,
                 source_hash = COALESCE(%s, source_hash),
                 embed_version = COALESCE(%s, embed_version),
                 progress = %s,
+                storage_key = COALESCE(%s, storage_key),
                 updated_at = now()
             WHERE id = %s
             """,
             (status, error, title, page_count, chunk_count, source_hash,
-             embed_version, progress, doc_id),
+             embed_version, progress, storage_key, doc_id),
         )
 
 

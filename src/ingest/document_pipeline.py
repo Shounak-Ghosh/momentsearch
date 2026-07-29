@@ -102,6 +102,14 @@ def t_fetch_doc(doc_id: str, user_id: str) -> str:
         content_type = ("application/pdf" if ext == ".pdf" else
                         "application/vnd.openxmlformats-officedocument.presentationml.presentation")
         storage.upload_file(path, archive_key, content_type)
+    # Persist the archive location so citations/GET /api/documents/{id}/file
+    # can serve these bytes back later. Written AFTER the archive is confirmed
+    # to exist (freshly uploaded above, or already there from a prior attempt)
+    # — never before — so a crash here just re-archives on retry instead of
+    # pointing a citation at bytes that don't exist (crash-safe ordering,
+    # AGENTS.md #3). For upload-sourced docs this is already set at
+    # registration time (same key) — the write is a harmless no-op then.
+    db.set_doc_status(doc_id, "fetching", storage_key=archive_key)
     return str(path)
 
 
