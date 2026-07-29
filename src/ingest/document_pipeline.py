@@ -50,8 +50,10 @@ from src import db, storage
 from src.config import (
     DECK_CAPTION_ENABLED,
     DECK_CAPTION_MAX_SLIDES,
-    DECK_THUMB_WIDTH,
     DOC_EMBED_BATCH,
+    PAGE_RENDER_WIDTH,
+    PAGE_THUMB_MAX_PAGES,
+    PAGE_THUMB_WIDTH,
     TEXT_EMBED_VERSION,
 )
 from src.rag import vector_store
@@ -207,9 +209,9 @@ def t_caption(doc_id: str, user_id: str, path: str, parsed: dict) -> dict:
             if caption:
                 captions[slide] = caption
                 # Store a lighter thumbnail than the render fed to the vision
-                # LLM — DECK_RENDER_WIDTH is sized for caption quality,
-                # DECK_THUMB_WIDTH for what the citation UI actually displays.
-                thumb = deck_mod.resize_jpeg(rendered[slide], DECK_THUMB_WIDTH)
+                # LLM — PAGE_RENDER_WIDTH is sized for caption quality,
+                # PAGE_THUMB_WIDTH for what the citation UI actually displays.
+                thumb = deck_mod.resize_jpeg(rendered[slide], PAGE_THUMB_WIDTH)
                 storage.put_bytes(storage.slide_key(user_id, doc_id, slide), thumb, "image/jpeg")
             done += 1
             db.set_doc_progress(doc_id, done / len(todo))
@@ -223,8 +225,35 @@ def t_caption(doc_id: str, user_id: str, path: str, parsed: dict) -> dict:
     return captions
 
 
+def _render_citation_thumbnails(doc_id: str, user_id: str, path: str, kind: str,
+                                 chunks: list[dict], captions: dict) -> None:
+    """Render + store a page/slide thumbnail for every distinct locator that
+    made it into the final chunk set, so every paper/deck citation has a real
+    snippet to show — not just the deck slides t_caption already rendered
+    (image-heavy ones it captioned). Capped at PAGE_THUMB_MAX_PAGES so a huge
+    document doesn't rasterize hundreds of pages on first ingest; a citation
+    past the cap just falls back to text in the UI. One page's render failure
+    is logged and skipped inside render_pages/render_slides — never fails the
+    whole ingest."""
+    locator = "slide" if kind == "deck" else "page"
+    wanted = sorted({c[locator] for c in chunks})[:PAGE_THUMB_MAX_PAGES]
+    if not wanted:
+        return
+    if kind == "deck":
+        already = set(captions.keys())  # t_caption already rendered+stored these
+        todo = [p for p in wanted if p not in already]
+        rendered = deck_mod.render_slides(Path(path), todo) if todo else {}
+        key_fn = storage.slide_key
+    else:
+        rendered = paper_mod.render_pages(Path(path), wanted, width=PAGE_RENDER_WIDTH)
+        key_fn = storage.page_key
+    for p, jpeg in rendered.items():
+        thumb = paper_mod.resize_jpeg(jpeg, PAGE_THUMB_WIDTH)
+        storage.put_bytes(key_fn(user_id, doc_id, p), thumb, "image/jpeg")
+
+
 @task(name="doc-embed-index", retries=2, retry_delay_seconds=60)
-def t_embed_index_doc(doc_id: str, user_id: str, parsed: dict, captions: dict) -> int:
+def t_embed_index_doc(doc_id: str, user_id: str, path: str, parsed: dict, captions: dict) -> int:
     """Page/slide-aware chunk -> batched text embeddings -> idempotent upsert
     into the shared text collection (moments_text) — same collection videos'
     transcripts and papers already index into."""
@@ -236,6 +265,8 @@ def t_embed_index_doc(doc_id: str, user_id: str, parsed: dict, captions: dict) -
         chunks = paper_mod.chunk_pages(parsed["units"])
     if not chunks:
         raise RuntimeError("No text could be extracted from the document.")
+
+    _render_citation_thumbnails(doc_id, user_id, path, kind, chunks, captions)
 
     db.set_doc_status(doc_id, "embedding", progress=0.0, chunk_count=len(chunks))
     vector_store.ensure_text_collection()
@@ -282,7 +313,7 @@ def ingest_document(doc_id: str, user_id: str) -> dict:
             return {"doc_id": doc_id, "skipped": True}
         parsed = t_parse(doc_id, user_id, path)
         captions = t_caption(doc_id, user_id, path, parsed)  # no-op for papers
-        n = t_embed_index_doc(doc_id, user_id, parsed, captions)
+        n = t_embed_index_doc(doc_id, user_id, path, parsed, captions)
         print(f"[ingest] {doc_id} indexed: {n} chunks across {len(parsed['units'])} "
               f"{'slides' if parsed['kind'] == 'deck' else 'pages'} (attempt {attempt})")
         return {"doc_id": doc_id, "chunks": n, "units": len(parsed["units"])}

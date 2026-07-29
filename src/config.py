@@ -146,8 +146,11 @@ DECK_MIN_CHUNK_CHARS = _int("DECK_MIN_CHUNK_CHARS", 60)  # lower than papers —
 DECK_CAPTION_ENABLED = _envbool("DECK_CAPTION_ENABLED", True)
 DECK_CAPTION_MIN_CHARS = _int("DECK_CAPTION_MIN_CHARS", 200)  # below this -> caption the slide
 DECK_CAPTION_MAX_SLIDES = _int("DECK_CAPTION_MAX_SLIDES", 80)  # hard cost cap per deck
-DECK_RENDER_WIDTH = _int("DECK_RENDER_WIDTH", 1024)   # rasterized px fed to the vision LLM
-DECK_THUMB_WIDTH = _int("DECK_THUMB_WIDTH", 480)      # stored citation thumbnail
+# Rasterization widths — shared by deck slides AND paper pages (same
+# pypdfium2 renderer, src/ingest/paper.py:render_pages).
+PAGE_RENDER_WIDTH = _int("PAGE_RENDER_WIDTH", 1024)   # rasterized px fed to the vision LLM
+PAGE_THUMB_WIDTH = _int("PAGE_THUMB_WIDTH", 480)      # stored citation thumbnail
+PAGE_THUMB_MAX_PAGES = _int("PAGE_THUMB_MAX_PAGES", 150)  # hard cap on rendered page thumbnails per doc
 
 # --- Fair scheduling (WFQ) ----------------------------------------------------
 # FIFO (default off): register enqueues to Prefect immediately -> Prefect runs

@@ -217,6 +217,7 @@ let SELECTED=new Set(), KNOWN=new Set(), SAMPLE_INDEXED=[];
 const SELECTABLE = ()=> MODE==="full";
 const isDoc=v=>v.kind==="paper"||v.kind==="deck";
 const apiBase=v=>isDoc(v)?"/api/documents/":"/api/videos/";
+const KIND_ICON={paper:"📄", deck:"🖼"};
 async function loadSources(){
   const {sources}=await (await fetch("/admin/sources")).json();
   const videos=sources;
@@ -266,7 +267,6 @@ async function loadSources(){
       default:           return {icon:"•", label:v.status,            c:"text-muted"};
     }
   }
-  const KIND_ICON={paper:"📄", deck:"🖼"};
   box.innerHTML=shown.map(v=>{
     const indexed=v.status==="indexed";
     const b=badge(v);
@@ -421,13 +421,17 @@ function renderSources(){
     const tags=mods.map(m=>m==="frame"
       ? '<span class="text-[9px] px-1 rounded bg-coral/15 text-coral2">seen</span>'
       : '<span class="text-[9px] px-1 rounded bg-[#cfe8d6] text-[#1f7a43]">said</span>').join(" ");
-    // Text-only moments have no frame; they're always YouTube, so fall back to
-    // the video's thumbnail instead of an empty "(no frame)" placeholder.
-    const yid = ytId(c);
+    const isDocKind = c.kind==="paper"||c.kind==="deck";
+    // Text-only video moments have no frame; they're always YouTube, so fall
+    // back to the video's thumbnail instead of an empty "(no frame)" placeholder.
+    const yid = isDocKind ? null : ytId(c);
     const img = c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
+    const placeholder = isDocKind
+      ? `${KIND_ICON[c.kind]}<br>${c.kind==="deck" ? `Slide ${c.slide||"?"}` : `Page ${c.page||"?"}`}`
+      : "transcript moment<br>(no frame)";
     const thumb = img
       ? `<img loading="lazy" src="${esc(img)}" class="w-full h-full object-cover" onerror="this.style.opacity=0">`
-      : `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">transcript moment<br>(no frame)</div>`;
+      : `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">${placeholder}</div>`;
     const quote = c.transcript
       ? `<div class="text-[11px] text-muted italic mt-1 line-clamp-2">“${esc(c.transcript)}”</div>` : "";
     return `
@@ -447,15 +451,21 @@ function renderSources(){
   $("#sources").querySelectorAll(".source").forEach(el=>el.onclick=()=>playCitation(+el.dataset.n));
 }
 
-/* ---------- moment player (YouTube embed seeked to second, or <video> for uploads) ---------- */
+/* ---------- moment player: video (YouTube/<video>) or document (PDF/image) ---------- */
 function ytId(c){ if(c.video_id&&c.video_id.startsWith("yt_")) return c.video_id.slice(3);
   const m=(c.url||"").match(/(?:youtu\.be\/|v=)([\w-]{11})/); return m?m[1]:null; }
 function playCitation(n){
   const c=CITES.find(x=>x.n===n); if(!c)return;
-  const secs=Math.floor((c.ms||0)/1000);
   $("#mTitle").textContent=c.title||c.video_id;
+  $("#mOut").href=c.deeplink||"#";
+  const box=$("#playerBox");
+  if(c.kind==="paper"||c.kind==="deck") renderDocPlayer(c,box); else renderVideoPlayer(c,box);
+  $("#modal").classList.remove("hidden"); document.body.style.overflow="hidden";
+}
+function renderVideoPlayer(c, box){
+  const secs=Math.floor((c.ms||0)/1000);
   $("#mMeta").textContent = c.transcript ? `“${c.transcript}”` : `Moment at ${c.timestamp}`;
-  const box=$("#playerBox"); const yid=ytId(c);
+  const yid=ytId(c);
   // Frame preview if we have one; otherwise (text-only YouTube moment) the
   // video's thumbnail, so the modal never shows an empty preview.
   const preview = c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
@@ -466,7 +476,6 @@ function playCitation(n){
   $("#mFrameDesc").textContent = isFrame
     ? "This is what CLIP matched your question against — the still it judged closest to what you asked."
     : "This moment matched on what was said (transcript). Shown is the video’s thumbnail — press play to jump to the exact spot.";
-  $("#mOut").href=c.deeplink||"#";
   if(yid){
     box.innerHTML=`<iframe class="w-full h-full" src="https://www.youtube.com/embed/${yid}?start=${secs}&autoplay=1&rel=0"
       title="moment" frameborder="0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
@@ -475,7 +484,38 @@ function playCitation(n){
     const v=box.querySelector("video"); const seek=()=>{ try{v.currentTime=secs;}catch(e){} };
     if(v.readyState>=1) seek(); else v.addEventListener("loadedmetadata",seek,{once:true});
   }
-  $("#modal").classList.remove("hidden"); document.body.style.overflow="hidden";
+}
+function renderDocPlayer(c, box){
+  const locatorLabel = c.kind==="deck" ? "Slide" : "Page";
+  const n = c.kind==="deck" ? c.slide : c.page;
+  $("#mMeta").textContent = c.transcript ? `“${c.transcript}”` : `${locatorLabel} ${n||"?"}`;
+  // Inline PDF embed only for URL-sourced PDFs — uploads have no public URL,
+  // and some hosts send X-Frame-Options that silently blank the iframe (no JS
+  // error fires when that happens), so this is a best-effort upgrade, never
+  // the only content: the footer thumbnail strip below always carries the
+  // rendered snippet as a fallback.
+  // A paper is ALWAYS a PDF (ingestion contract), so no extension check is
+  // needed there. A deck can be PDF or PPTX, and its URL isn't guaranteed to
+  // end in ".pdf" (e.g. arxiv-style links like .../pdf/2312.10997 have no
+  // extension at all) — ruling out ".pptx" (the only other deck format) is
+  // the robust check, not requiring ".pdf".
+  const isPptx = (c.url||"").toLowerCase().split("?")[0].endsWith(".pptx");
+  const canEmbed = c.source!=="upload" && (c.kind==="paper" || !isPptx);
+  if(canEmbed){
+    box.innerHTML=`<iframe class="w-full h-full bg-white" src="${esc(c.url)}#page=${n}" title="document page"></iframe>`;
+  } else if(c.thumbnail){
+    box.innerHTML=`<img class="w-full h-full object-contain bg-white" src="${esc(c.thumbnail)}" alt="${locatorLabel} ${n}">`;
+  } else {
+    // No render available (old doc ingested before this, or past the render
+    // cap) — text-forward fallback, never an empty box.
+    box.innerHTML=`<div class="w-full h-full flex items-center justify-center bg-paper2 p-6 text-center">
+      <div class="max-w-md text-sm text-ink italic">“${esc(c.text||c.transcript||"")}”</div>
+    </div>`;
+  }
+  $("#mFrame").style.display = c.thumbnail ? "" : "none";
+  if(c.thumbnail) $("#mFrame").src = c.thumbnail;
+  $("#mFrameLabel").textContent = c.kind==="deck" ? "Matched slide" : "Matched page";
+  $("#mFrameDesc").textContent = `This ${locatorLabel.toLowerCase()} matched on its text — press “Open on source” to view the original document.`;
 }
 function closeModal(){ $("#playerBox").innerHTML=""; $("#modal").classList.add("hidden"); document.body.style.overflow=""; }
 $("#mClose").onclick=closeModal;

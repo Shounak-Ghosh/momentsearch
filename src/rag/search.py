@@ -212,7 +212,10 @@ def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
                 thumbnail = f"/api/slide/{w['video_id']}/{slide:04d}.jpg?u={user_id}"
         # PDF decks support the same #page= fragment as papers; a PPTX has no
         # page-anchored viewing convention, so its deeplink is just the file.
-        is_pdf = (uri or "").split("?", 1)[0].lower().endswith(".pdf")
+        # Ruling out ".pptx" (the only other deck format) rather than
+        # requiring ".pdf" — a URL-sourced PDF deck's link isn't guaranteed to
+        # end in ".pdf" (e.g. arxiv-style /pdf/2312.10997 has no extension).
+        is_pdf = not (uri or "").split("?", 1)[0].lower().endswith(".pptx")
         return {
             "n": n,
             "video_id": w["video_id"],
@@ -233,6 +236,13 @@ def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
             "modalities": sorted(w["modalities"]),
         }
     page = w.get("page")
+    thumbnail = None
+    if page:
+        key = storage.page_key(user_id, w["video_id"], page)
+        if storage.presign_capable():
+            thumbnail = storage.presign_get(key)
+        elif storage.exists(key):
+            thumbnail = f"/api/page/{w['video_id']}/{page:04d}.jpg?u={user_id}"
     return {
         "n": n,
         "video_id": w["video_id"],
@@ -244,7 +254,7 @@ def _doc_citation(n: int, w: dict, meta: dict, user_id: str) -> dict[str, Any]:
         "source": meta.get("source"),
         "timestamp": f"p. {page}" if page else "",
         "idx": None,
-        "thumbnail": None,
+        "thumbnail": thumbnail,
         "media_url": None,
         # A page-anchored PDF fragment — the browser's built-in viewer honors it.
         "deeplink": f"{uri}#page={page}" if uri and page else uri,

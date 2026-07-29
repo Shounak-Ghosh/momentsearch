@@ -7,6 +7,8 @@ into page-numbered chunks, so it's testable without any infrastructure).
 
   parse_pdf()   PDF -> [{page, text}], 1-indexed, page numbers preserved
   chunk_pages() pages -> [{text, page, page_end, idx}], NEVER spans a page
+  render_pages() pages -> {page: jpeg} — rasterized page (shared with deck)
+  resize_jpeg()  downscale a JPEG to citation thumbnail width
 
 Why chunks never cross a page: the citation locator IS the page number
 (A3_README's contract: a paper cites a page, not a passage). A chunker that
@@ -16,6 +18,7 @@ a page boundary is a better trade than a wrong locator.
 """
 from __future__ import annotations
 
+import io
 import re
 from pathlib import Path
 
@@ -142,3 +145,59 @@ def guess_title(pages: list[dict], fallback: str) -> str:
             if len(line) >= 8:
                 return line[:200]
     return fallback
+
+
+# ── Render (citation thumbnails; shared with deck.py's PDF-deck case) ────────
+
+def render_pages(path: Path, pages: list[int], *, width: int | None = None) -> dict[int, bytes]:
+    """Page numbers -> rasterized JPEG (pypdfium2). A deck backed by a PDF is
+    one-page-per-slide, so deck.py's render_slides() calls straight through to
+    this for its PDF branch — one rasterizer, not two."""
+    import pypdfium2 as pdfium
+
+    from ..config import PAGE_RENDER_WIDTH
+
+    if not pages:
+        return {}
+    w = width or PAGE_RENDER_WIDTH
+    out: dict[int, bytes] = {}
+    doc = pdfium.PdfDocument(str(path))
+    try:
+        for p in pages:
+            idx = p - 1
+            if idx < 0 or idx >= len(doc):
+                continue
+            page = doc[idx]
+            try:
+                page_width_pt = page.get_size()[0]
+                scale = (w / page_width_pt) if page_width_pt else 1.0
+                bitmap = page.render(scale=scale)
+                try:
+                    img = bitmap.to_pil().convert("RGB")
+                finally:
+                    bitmap.close()
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                out[p] = buf.getvalue()
+            except Exception as exc:
+                print(f"[paper] page {p}: render failed ({type(exc).__name__}: {exc})")
+            finally:
+                page.close()
+    finally:
+        doc.close()
+    return out
+
+
+def resize_jpeg(jpeg: bytes, width: int) -> bytes:
+    """Downscale an already-rendered page/slide JPEG to a smaller citation
+    thumbnail width without rasterizing a second time."""
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(jpeg))
+    if max(img.size) <= width:
+        return jpeg
+    img = img.convert("RGB")
+    img.thumbnail((width, width))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()

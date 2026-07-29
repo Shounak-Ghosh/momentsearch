@@ -23,6 +23,7 @@ router = APIRouter(tags=["search"])
 UI_DIR = Path(__file__).resolve().parents[2] / "ui"
 _FRAME_RE = re.compile(r"^\d{6}\.jpg$")
 _SLIDE_RE = re.compile(r"^\d{4}\.jpg$")
+_PAGE_RE = re.compile(r"^\d{4}\.jpg$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -174,6 +175,20 @@ def slide(doc_id: str, name: str, u: str | None = None):
     fp = storage.local_path(f"{config.DOC_KEY_PREFIX}{_uid(u)}/{doc_id}/slides/{name}")
     if not fp.exists():
         raise HTTPException(404, "Slide not found.")
+    return FileResponse(fp, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.get("/api/page/{doc_id}/{name}")
+def page(doc_id: str, name: str, u: str | None = None):
+    """Rendered paper-page thumbnail (local-dev only — storage.page_key)."""
+    if storage.presign_capable():
+        raise HTTPException(404, "Thumbnails are served from object storage.")
+    if not _PAGE_RE.match(name):
+        raise HTTPException(404, "Page not found.")
+    fp = storage.local_path(f"{config.DOC_KEY_PREFIX}{_uid(u)}/{doc_id}/pages/{name}")
+    if not fp.exists():
+        raise HTTPException(404, "Page not found.")
     return FileResponse(fp, media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=86400"})
 

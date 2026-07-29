@@ -85,6 +85,15 @@ def slide_prefix(user_id: str, doc_id: str) -> str:
     return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/slides/"
 
 
+def page_key(user_id: str, doc_id: str, page: int) -> str:
+    """Rendered page thumbnail (paper citations point the UI here)."""
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/pages/{page:04d}.jpg"
+
+
+def page_prefix(user_id: str, doc_id: str) -> str:
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/pages/"
+
+
 def doc_prefix(user_id: str, doc_id: str) -> str:
     return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}/"
 

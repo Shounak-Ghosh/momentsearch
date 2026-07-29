@@ -24,7 +24,7 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
-from ..config import DECK_CAPTION_MIN_CHARS, DECK_CHUNK_CHARS, DECK_MIN_CHUNK_CHARS, DECK_RENDER_WIDTH
+from ..config import DECK_CAPTION_MIN_CHARS, DECK_CHUNK_CHARS, DECK_MIN_CHUNK_CHARS, PAGE_RENDER_WIDTH
 from . import paper as paper_mod
 from .paper import _paragraphs, _split_long  # reuse paper's text-hygiene helpers
 
@@ -86,46 +86,17 @@ def _collect_shape_text(shapes, out: list[str]) -> None:
 # ── Render (for vision captioning + citation thumbnails) ─────────────────────
 
 def render_slides(path: Path, slides: list[int], *, width: int | None = None) -> dict[int, bytes]:
-    """Slide numbers -> representative JPEG. PDF: rasterize the page. PPTX:
-    can't be rendered without a graphics engine — use the largest embedded
-    picture instead (a slide with no picture and no chart image yields no
-    render, which is fine: it just gets no caption)."""
+    """Slide numbers -> representative JPEG. PDF: rasterize the page (shares
+    paper.py's rasterizer — a PDF deck is one-page-per-slide, same operation
+    under a different name). PPTX: can't be rendered without a graphics
+    engine — use the largest embedded picture instead (a slide with no
+    picture and no chart image yields no render, which is fine: it just gets
+    no caption)."""
     if not slides:
         return {}
     if path.suffix.lower() == PPTX_EXT:
-        return _render_pptx(path, slides, width or DECK_RENDER_WIDTH)
-    return _render_pdf(path, slides, width or DECK_RENDER_WIDTH)
-
-
-def _render_pdf(path: Path, slides: list[int], width: int) -> dict[int, bytes]:
-    import pypdfium2 as pdfium
-
-    out: dict[int, bytes] = {}
-    doc = pdfium.PdfDocument(str(path))
-    try:
-        for s in slides:
-            idx = s - 1
-            if idx < 0 or idx >= len(doc):
-                continue
-            page = doc[idx]
-            try:
-                page_width_pt = page.get_size()[0]
-                scale = (width / page_width_pt) if page_width_pt else 1.0
-                bitmap = page.render(scale=scale)
-                try:
-                    img = bitmap.to_pil().convert("RGB")
-                finally:
-                    bitmap.close()
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=85)
-                out[s] = buf.getvalue()
-            except Exception as exc:
-                print(f"[deck] slide {s}: render failed ({type(exc).__name__}: {exc})")
-            finally:
-                page.close()
-    finally:
-        doc.close()
-    return out
+        return _render_pptx(path, slides, width or PAGE_RENDER_WIDTH)
+    return paper_mod.render_pages(path, slides, width=width or PAGE_RENDER_WIDTH)
 
 
 def _render_pptx(path: Path, slides: list[int], width: int) -> dict[int, bytes]:
@@ -154,20 +125,7 @@ def _render_pptx(path: Path, slides: list[int], width: int) -> dict[int, bytes]:
     return out
 
 
-def resize_jpeg(jpeg: bytes, width: int) -> bytes:
-    """Downscale an already-rendered slide JPEG to a smaller width — used to
-    turn the (larger) vision-LLM render into a lighter citation thumbnail
-    without rasterizing the slide a second time."""
-    from PIL import Image
-
-    img = Image.open(io.BytesIO(jpeg))
-    if max(img.size) <= width:
-        return jpeg
-    img = img.convert("RGB")
-    img.thumbnail((width, width))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
+resize_jpeg = paper_mod.resize_jpeg  # shared downscale helper, moved to paper.py
 
 
 def _largest_picture_blob(shapes) -> bytes | None:
